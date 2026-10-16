@@ -22,4 +22,7 @@ enum RuzuFFI {
 
     /// 可能闪退，调用前必须让用户知情。
     static var jitProbeUnsigned: String { take(ruzu_ios_jit_probe_unsafe()) }
+
+    /// NCE 可行性预检。可能闪退。
+    static var ncePrecheck: String { take(ruzu_ios_nce_precheck()) }
 }
