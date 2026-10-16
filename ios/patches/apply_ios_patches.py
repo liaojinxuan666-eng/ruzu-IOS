@@ -421,6 +421,98 @@ edit(
 )
 
 # ---------------------------------------------------------------------------
+# 7. 两个 build.rs：iOS 上跳过宿主 pkg-config 依赖
+# ---------------------------------------------------------------------------
+# 这两个 crate 的 build.rs 都用 pkg-config 探测宿主库，CI 上必然报
+#   "pkg-config has not been configured to support cross-compilation"
+# 而且就算探测到，宿主（macOS runner）编出来的库也不能链进 iOS App。
+# 所以 iOS 上跳过探测：
+#   * audio_core → libopus（Opus 解码）
+#   * video_core → libavcodec/libavutil/libva（nvdec 视频解码）+ ffmpeg shim
+# cargo check 不做链接，跳过探测不影响它；链接阶段（真要跑模拟器时）再单独给
+# iOS 交叉编译这两个库，或换纯 Rust 解码器。
+edit(
+    "src/audio_core/build.rs",
+    [
+        (
+            "    pkg_config::Config::new()\n"
+            '        .probe("opus")\n'
+            '        .expect("libopus is required for audio_core Opus decoding");',
+            "    // iOS：跳过 libopus 探测。\n"
+            "    // 1) CI 上没有配置交叉编译用的 pkg-config sysroot，直接探测会 panic；\n"
+            "    // 2) 宿主（macOS runner）的 libopus 是给 macOS 用的，链进 iOS App 是错的。\n"
+            "    // 真要用 Opus 时再给 iOS 交叉编译一份 libopus，或换成纯 Rust 解码器。\n"
+            '    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("ios") {\n'
+            "        println!(\"cargo:warning=audio_core: iOS 目标暂时跳过 libopus 探测\");\n"
+            "        return;\n"
+            "    }\n"
+            "    pkg_config::Config::new()\n"
+            '        .probe("opus")\n'
+            '        .expect("libopus is required for audio_core Opus decoding");',
+            "audio_core/build.rs 跳过 iOS 上的 libopus",
+        ),
+    ],
+)
+
+_VC_BUILD_OLD = '''    let avcodec = pkg_config::Config::new()
+        .probe("libavcodec")
+        .expect("libavcodec is required for video_core FFmpeg decoding");
+    let avutil = pkg_config::Config::new()
+        .probe("libavutil")
+        .expect("libavutil is required for video_core FFmpeg decoding");
+    let libva = match std::env::var("CARGO_CFG_TARGET_OS").as_deref() {
+        Ok("linux" | "freebsd") => pkg_config::Config::new().probe("libva").ok(),
+        _ => None,
+    };
+
+    let mut build = cc::Build::new();
+    build.file("src/host1x/ffmpeg/ffmpeg_shim.c");
+    build.warnings(false);
+    for path in avcodec
+        .include_paths
+        .iter()
+        .chain(avutil.include_paths.iter())
+    {
+        build.include(path);
+    }
+    if let Some(libva) = &libva {
+        build.define("LIBVA_FOUND", None);
+        for path in &libva.include_paths {
+            build.include(path);
+        }
+    }
+    build.compile("ruzu_video_core_ffmpeg_shim");
+'''
+
+_vc_build = os.path.join(ROOT, "src/video_core/build.rs")
+if not os.path.exists(_vc_build):
+    log("MISSING", "src/video_core/build.rs")
+    problems.append("src/video_core/build.rs 不存在")
+else:
+    _t = _read(_vc_build)
+    _nl = "\r\n" if "\r\n" in _t else "\n"
+    _old = _VC_BUILD_OLD if _nl == "\n" else _VC_BUILD_OLD.replace("\n", "\r\n")
+    if "iOS_FLAG_SKIP_FFMPEG" in _t:
+        log("SKIP", "src/video_core/build.rs", "已有 iOS 的 FFmpeg 跳过逻辑")
+    elif _old in _t:
+        _indented = "".join("    " + ln if ln.strip() else ln for ln in _old.splitlines(True))
+        _new = (
+            "    // iOS_FLAG_SKIP_FFMPEG：iOS 上跳过 FFmpeg 相关的一切。\n"
+            "    // 理由同 audio_core 的 libopus：pkg-config 交叉编译不可用，宿主库也不能链进 iOS。\n"
+            "    // 视频硬件解码（nvdec）是后期功能，先让骨架能编过。\n"
+            '    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("ios") {\n'
+            + _indented
+            + "    }\n"
+        )
+        _t = _t.replace(_old, _new)
+        _write(_vc_build, _t)
+        log("PATCHED", "src/video_core/build.rs", "iOS 跳过 FFmpeg 探测与 shim 编译")
+        changed += 1
+    else:
+        log("MISS", "src/video_core/build.rs", "未找到 FFmpeg 探测块")
+        problems.append("src/video_core/build.rs: 未找到 FFmpeg 探测块")
+
+# ---------------------------------------------------------------------------
 print()
 print(f"=== 补丁完成：{changed} 个文件被修改 ===")
 if problems:

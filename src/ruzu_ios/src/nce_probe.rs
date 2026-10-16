@@ -143,7 +143,7 @@ fn probe_executable_guest_va(out: &mut String) {
                         } else {
                             writeln!(out, "[??]   ①-c 执行了但返回 {v}（期望 7）").unwrap();
                         }
-                        libc::munmap(p, PAGE);
+                        libc::munmap(p as *mut c_void, PAGE);
                     }
                     Err(e) => writeln!(
                         out,
