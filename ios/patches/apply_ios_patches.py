@@ -145,20 +145,6 @@ edit(
     "externals/rhazel/src/block_of_code.rs",
     [
         (RH_CFG_OLD, RH_CFG_NEW, "JIT 写保护/刷 I-cache 的 cfg 放开到 iOS"),
-        (
-            '    #[cfg(target_os = "macos")]\n'
-            "    let flags = libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT;",
-            '    #[cfg(any(target_os = "macos", target_os = "ios"))]\n'
-            "    let flags = libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT;",
-            "代码缓存 mmap 走 MAP_JIT",
-        ),
-        (
-            '    #[cfg(not(target_os = "macos"))]\n'
-            "    let flags = libc::MAP_PRIVATE | libc::MAP_ANON;",
-            '    #[cfg(not(any(target_os = "macos", target_os = "ios")))]\n'
-            "    let flags = libc::MAP_PRIVATE | libc::MAP_ANON;",
-            "非 Apple 平台走普通 RWX",
-        ),
     ],
 )
 
@@ -216,6 +202,82 @@ unsafe fn ios_set_jit_write_protect(enabled: bool) {
     }
 }'''
 
+_RH_MMAP_OLD = '''unsafe fn mmap_code_cache(size: usize) -> Result<NonNull<u8>, String> {
+    #[cfg(target_os = "macos")]
+    let flags = libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT;
+    #[cfg(not(target_os = "macos"))]
+    let flags = libc::MAP_PRIVATE | libc::MAP_ANON;
+
+    let ptr = libc::mmap(
+        std::ptr::null_mut(),
+        size,
+        libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+        flags,
+        -1,
+        0,
+    );
+    if ptr == libc::MAP_FAILED {
+        return Err(format!(
+            "failed to allocate ARM64 executable code cache: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    NonNull::new(ptr.cast::<u8>()).ok_or_else(|| "mmap returned null".to_string())
+}'''
+
+_RH_MMAP_NEW = '''unsafe fn mmap_code_cache(size: usize) -> Result<NonNull<u8>, String> {
+    // iOS：分两步试。
+    //   ① WebKit 的官方 JIT 姿势：RW + MAP_JIT（**不要**在这里就请求 PROT_EXEC）。
+    //      真机实测 RWX + MAP_JIT 在 iOS 上直接 errno=22 (EINVAL)；
+    //      可执行性靠"关写保护 → 写入 → 开写保护"翻转拿到。
+    //   ② 退回 macOS 上的老写法：RWX + MAP_JIT。
+    #[cfg(target_os = "ios")]
+    {
+        let jit = libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT;
+        for prot in [
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+        ] {
+            let p = libc::mmap(std::ptr::null_mut(), size, prot, jit, -1, 0);
+            if p != libc::MAP_FAILED {
+                if let Some(n) = NonNull::new(p.cast::<u8>()) {
+                    return Ok(n);
+                }
+            }
+        }
+        return Err(format!(
+            "failed to allocate ARM64 executable code cache (iOS, MAP_JIT): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    #[cfg(not(target_os = "ios"))]
+    {
+        #[cfg(target_os = "macos")]
+        let flags = libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT;
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let flags = libc::MAP_PRIVATE | libc::MAP_ANON;
+
+        let ptr = libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+            flags,
+            -1,
+            0,
+        );
+        if ptr == libc::MAP_FAILED {
+            return Err(format!(
+                "failed to allocate ARM64 executable code cache: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        NonNull::new(ptr.cast::<u8>()).ok_or_else(|| "mmap returned null".to_string())
+    }
+}'''
+
 edit(
     "externals/rhazel/src/block_of_code.rs",
     [
@@ -236,6 +298,8 @@ edit(
             "    let _ = enabled;",
             "set_jit_write_protect 在 iOS 上走 dlsym 版本",
         ),
+        # iOS 的 mmap 姿势：分两步试，先 WebKit 姿势（RW + MAP_JIT），再退回 RWX
+        (_RH_MMAP_OLD, _RH_MMAP_NEW, "iOS 的 JIT 内存映射改用梯子式尝试"),
     ],
 )
 

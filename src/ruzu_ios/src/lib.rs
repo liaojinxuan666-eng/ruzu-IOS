@@ -66,43 +66,139 @@ unsafe fn csops(op: c_int, buf: *mut c_void, size: usize) -> c_int {
     )
 }
 
-/// 直接向内核问「我有没有 JIT 权限」，而不是靠 mmap 试错。
+/// 直接向内核问「我有没有 JIT 权限」，而不是靠单次 mmap 试错。
 ///
-/// 这是这一版新增的关键诊断：之前只能看到 `mmap(MAP_JIT) errno=22`，
-/// 现在能明确区分三种原因 ——
-///   * 没被调试器 attach（无 CS_DEBUGGED）→ 用 StikDebug / debugserver 挂一下
-///   * entitlements 里没有 dynamic-codesigning → 重新签名时带上
-///   * 两者都有却还是失败 → 那就是内核策略问题
+/// 输出三块：
+///   1. `csops(CS_OPS_STATUS)` 的代码签名标志（含 CS_DEBUGGED 位解码）
+///   2. `csops(CS_OPS_ENTITLEMENTS_BLOB)` 的 entitlements 原文（找关键键 + 报格式）
+///   3. 四种「拿可执行内存」策略逐一实测，各报自己的 errno
+///
+/// 这样无论处于哪种状态，都能定位到具体缺哪一环，而不是只知道一个 errno=22。
 fn codesign_report() -> String {
     let mut out = String::new();
     unsafe {
+        // ---------- 1. 代码签名标志 ----------
         let mut flags: u32 = 0;
         if csops(CS_OPS_STATUS, &mut flags as *mut u32 as *mut c_void, 4) == 0 {
-            let tag = if flags & CS_DEBUGGED != 0 {
-                "有 CS_DEBUGGED（调试器已 attach → 具备 JIT 资格）"
-            } else {
-                "无 CS_DEBUGGED（没有调试器 attach）"
-            };
-            writeln!(out, "代码签名标志: 0x{flags:08x} —— {tag}").unwrap();
+            writeln!(out, "代码签名标志: 0x{flags:08x}").unwrap();
+            // 位含义取自 XNU cs_blobs.h，只解码几个与 JIT 相关的
+            let bits = [
+                (0x0000_0100u32, "CS_HARD"),
+                (0x0000_0200, "CS_KILL"),
+                (0x0000_0800, "CS_RESTRICT"),
+                (0x0000_2000, "CS_REQUIRE_LV"),
+                (0x0400_0000, "CS_PLATFORM_BINARY"),
+                (0x1000_0000, "CS_DEBUGGED"),
+            ];
+            let mut names = Vec::new();
+            for (bit, name) in bits {
+                if flags & bit != 0 {
+                    names.push(name);
+                }
+            }
+            writeln!(
+                out,
+                "  置位: {}{}",
+                if names.is_empty() { "（无已知位）".to_string() } else { names.join(" ") },
+                if flags & CS_DEBUGGED != 0 { "  ← 有 JIT 资格" } else { "" }
+            )
+            .unwrap();
         } else {
-            writeln!(out, "csops(STATUS) 失败 errno={}（被沙盒拦了？）", *libc::__error()).unwrap();
+            writeln!(out, "csops(STATUS) 失败 errno={}（沙盒拦了 syscall？）", *libc::__error()).unwrap();
         }
 
-        let mut buf = vec![0u8; 16 * 1024];
-        if csops(CS_OPS_ENTITLEMENTS_BLOB, buf.as_mut_ptr() as *mut c_void, buf.len()) == 0 {
-            let text = String::from_utf8_lossy(&buf);
+        // ---------- 2. entitlements 原文 ----------
+        let mut buf = vec![0u8; 32 * 1024];
+        let r = csops(CS_OPS_ENTITLEMENTS_BLOB, buf.as_mut_ptr() as *mut c_void, buf.len());
+        if r >= 0 {
+            // csops 成功时可能返回长度，也可能返 0；统一按"去掉尾部 NUL"来定实际长度
+            let mut len = if r > 0 { (r as usize).min(buf.len()) } else { buf.len() };
+            while len > 0 && buf[len - 1] == 0 {
+                len -= 1;
+            }
+            let text = String::from_utf8_lossy(&buf[..len]).into_owned();
+            let kind = if text.contains("<?xml") || text.contains("<plist") {
+                "XML plist"
+            } else if text.trim().is_empty() {
+                "空（本 App 没有任何 entitlements！）"
+            } else {
+                "非 XML（可能是 DER 二进制）"
+            };
+            writeln!(out, "entitlements: {len} 字节，格式={kind}").unwrap();
             let has = |k: &str| if text.contains(k) { "有" } else { "无" };
             writeln!(
                 out,
-                "entitlements: dynamic-codesigning={} | get-task-allow={} | increased-memory-limit={} | extended-virtual-addressing={}",
+                "  dynamic-codesigning={} | get-task-allow={} | increased-memory-limit={} | extended-virtual-addressing={}",
                 has("dynamic-codesigning"),
                 has("get-task-allow"),
                 has("increased-memory-limit"),
                 has("extended-virtual-addressing"),
             )
             .unwrap();
+            if text.trim().is_empty() || !text.contains("<?xml") {
+                let head: String = text.chars().take(160).collect();
+                if !head.trim().is_empty() {
+                    writeln!(out, "  开头 160 字符: {}", head.replace('\n', "⏎")).unwrap();
+                }
+            }
         } else {
             writeln!(out, "csops(ENTITLEMENTS_BLOB) 失败 errno={}", *libc::__error()).unwrap();
+        }
+
+        // ---------- 3. 四种拿可执行内存的策略 ----------
+        let page = 64 * 1024usize;
+        let rw = libc::PROT_READ | libc::PROT_WRITE;
+        let rwx = rw | libc::PROT_EXEC;
+
+        writeln!(out, "可执行内存策略实测:").unwrap();
+
+        // A：RWX + MAP_JIT（Apple 官方 JIT 姿势）
+        match mmap_region(page, rwx, true) {
+            Ok(p) => {
+                writeln!(out, "  A. RWX + MAP_JIT            → [OK] @ {p:p}").unwrap();
+                libc::munmap(p, page);
+            }
+            Err(e) => writeln!(out, "  A. RWX + MAP_JIT            → errno={e}").unwrap(),
+        }
+
+        // B：RW + MAP_JIT（不含 PROT_EXEC）—— 能过说明 MAP_JIT 本身是被允许的，
+        //    缺的只是「可执行」那一环
+        match mmap_region(page, rw, true) {
+            Ok(p) => {
+                writeln!(out, "  B. RW  + MAP_JIT（不含 X）   → [OK] @ {p:p}").unwrap();
+                // 再试试能不能靠 mprotect 补上可执行
+                if libc::mprotect(p, page, rwx) == 0 {
+                    writeln!(out, "     └ 追加 mprotect(RWX)      → [OK]（可执行也能开）").unwrap();
+                } else {
+                    writeln!(out, "     └ 追加 mprotect(RWX)      → errno={}", *libc::__error()).unwrap();
+                }
+                libc::munmap(p, page);
+            }
+            Err(e) => writeln!(out, "  B. RW  + MAP_JIT（不含 X）   → errno={e}").unwrap(),
+        }
+
+        // C：RW（无 MAP_JIT）→ mprotect(RX)
+        match mmap_region(page, rw, false) {
+            Ok(p) => {
+                let r2 = libc::mprotect(p, page, libc::PROT_READ | libc::PROT_EXEC);
+                writeln!(
+                    out,
+                    "  C. RW（无 MAP_JIT）→ mprotect(RX) → {}",
+                    if r2 == 0 { "[OK]".to_string() } else { format!("errno={}", *libc::__error()) }
+                )
+                .unwrap();
+                libc::munmap(p, page);
+            }
+            Err(e) => writeln!(out, "  C. RW（无 MAP_JIT）          → errno={e}").unwrap(),
+        }
+
+        // D：RWX（无 MAP_JIT）—— 越狱环境常见，但**只映射不执行**（执行会闪退）
+        match mmap_region(page, rwx, false) {
+            Ok(p) => {
+                writeln!(out, "  D. RWX（无 MAP_JIT）         → [OK] 映射成功（执行会怎样另说）").unwrap();
+                libc::munmap(p, page);
+            }
+            Err(e) => writeln!(out, "  D. RWX（无 MAP_JIT）         → errno={e}").unwrap(),
         }
     }
     out
@@ -202,31 +298,60 @@ fn describe(result: Result<u32, i32>) -> String {
     }
 }
 
-/// 官方路径：MAP_JIT + `pthread_jit_write_protect_np`。安全入口。
+/// 官方路径探针。
+///
+/// **2026-10-17 真机教训**：我之前用 `mmap(PROT_READ|PROT_WRITE|PROT_EXEC, MAP_JIT)`
+/// 拿 JIT 内存，iOS 上直接 `errno=22 (EINVAL)`。而 WebKit（JSC）在 Apple 平台
+/// 从不这么写 —— 它是 **先 `mmap(PROT_READ|PROT_WRITE, MAP_JIT)` 映射**，
+/// 可执行性靠「关写保护 → 写入 → 开写保护」翻转拿到。
+/// 所以这里改成：先试 WebKit 姿势，失败再退回 RWX 版本。
 fn probe_official() -> String {
     let mut out = String::new();
     let len = 4096usize;
-    let rwx = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
+    let rw = libc::PROT_READ | libc::PROT_WRITE;
+    let rwx = rw | libc::PROT_EXEC;
     unsafe {
+        // 策略 1（WebKit 姿势）：RW + MAP_JIT
+        match mmap_region(len, rw, true) {
+            Ok(p) => {
+                writeln!(out, "[OK]  mmap(RW + MAP_JIT) 成功 @ {p:p}（WebKit 的官方 JIT 姿势）").unwrap();
+                writeln!(out, "      {}", jitmem::status_line()).unwrap();
+                match write_code(p, len) {
+                    Ok(()) => {
+                        let r = call_code(p);
+                        writeln!(out, "[OK]  写入并执行：{}", describe(Ok(r))).unwrap();
+                    }
+                    Err(e) => writeln!(out, "[FAIL] 映射成功但写入失败：{e}").unwrap(),
+                }
+                libc::munmap(p, len);
+                return out;
+            }
+            Err(e) => {
+                writeln!(out, "[??]  mmap(RW + MAP_JIT) 失败 errno={e}，退回 RWX 版本再试一次").unwrap();
+            }
+        }
+
+        // 策略 2（macOS 上的写法）：RWX + MAP_JIT
         match mmap_region(len, rwx, true) {
             Ok(p) => {
                 match write_code(p, len) {
                     Ok(()) => {
                         let r = call_code(p);
                         if r == PROBE_EXPECT {
-                            writeln!(out, "[OK]  MAP_JIT + 写保护：{}", describe(Ok(r))).unwrap();
+                            writeln!(out, "[OK]  RWX + MAP_JIT：{}", describe(Ok(r))).unwrap();
                         } else {
-                            writeln!(out, "[??]  MAP_JIT + 写保护：{}", describe(Ok(r))).unwrap();
+                            writeln!(out, "[??]  RWX + MAP_JIT：{}", describe(Ok(r))).unwrap();
                         }
                     }
-                    Err(e) => writeln!(out, "[FAIL] MAP_JIT 页写入失败：{e}").unwrap(),
+                    Err(e) => writeln!(out, "[FAIL] RWX + MAP_JIT 页写入失败：{e}").unwrap(),
                 }
                 libc::munmap(p, len);
             }
             Err(e) => writeln!(
                 out,
-                "[FAIL] mmap(MAP_JIT) 失败 errno={e} —— 没有 JIT 权限。\n\
-                 errno 12(ENOMEM)/1(EPERM) 都可能出现：未越狱时需先用 StikDebug 之类挂上调试器再启动本 App。"
+                "[FAIL] mmap(RWX + MAP_JIT) 也失败 errno={e}\n\
+                 　　两条路都不通 → 本进程没有 JIT 权限。对照上面「可执行内存策略实测」与\n\
+                 　　「代码签名标志 / entitlements」，看是缺 CS_DEBUGGED 还是缺 dynamic-codesigning。"
             )
             .unwrap(),
         }
