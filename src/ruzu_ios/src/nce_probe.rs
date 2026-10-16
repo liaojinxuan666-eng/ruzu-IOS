@@ -284,6 +284,8 @@ fn probe_exclusive_monitor(out: &mut String) {
 // ------------------------------------------------------------------ ④ 信号处理器
 
 const SIGSEGV: c_int = 11;
+const SIGBUS: c_int = 10;
+const SIGUSR1: c_int = 30;
 
 #[repr(C)]
 struct SigAction {
@@ -293,43 +295,101 @@ struct SigAction {
 }
 
 static mut CAUGHT: c_int = 0;
-// setjmp 的缓冲区：Darwin arm64 的 jmp_buf 是 192 字节左右，给足 1024 字节余量。
-static mut JMPBUF: [u64; 128] = [0; 128];
+static mut USR1_HITS: c_int = 0;
 
 extern "C" {
-    fn setjmp(env: *mut c_void) -> c_int;
-    fn longjmp(env: *mut c_void, val: c_int) -> !;
     fn sigaction(sig: c_int, act: *const SigAction, old: *mut SigAction) -> c_int;
     fn raise(sig: c_int) -> c_int;
 }
 
-extern "C" fn segv_handler(_sig: c_int, _info: *mut c_void, _ctx: *mut c_void) {
+extern "C" fn segv_handler(_sig: c_int) {
+    // 只计数，**绝不 longjmp** —— 见下面 probe_signal_recovery 的说明。
     unsafe {
         CAUGHT += 1;
-        longjmp(JMPBUF.as_mut_ptr() as *mut c_void, 1);
     }
 }
 
+extern "C" fn usr1_handler(_sig: c_int) {
+    unsafe {
+        USR1_HITS += 1;
+    }
+}
+
+/// ④ 信号机制可用性。
+///
+/// **重要教训（2026-10-17 真机崩溃报告）**：上一版在这个测试里用
+/// `raise(SIGSEGV)` + 处理器内 `longjmp` 来模拟「从异常恢复」，结果真机上直接
+/// 崩了（`EXC_BAD_ACCESS`，跳到了垃圾地址 0xd0495e7e0）——
+/// 在信号处理器里 longjmp 需要配合 sigaltstack + sigsetjmp/siglongjmp，
+/// 而且不能想当然地跨 dispatch 线程乱跳。所以这一版改成**只验证不动跳转的部分**：
+///
+///   ① 能否注册 SIGSEGV / SIGBUS 处理器（NCE 靠它拦客户机访存异常）
+///   ② 能否安装备用信号栈（栈损坏时处理器还能跑）
+///   ③ 自己发一个 SIGUSR1，确认信号确实能送到我们的处理器
+///
+/// 「从硬件异常恢复」留到真正写 NCE 时，配 sigaltstack + sigsetjmp 一起做。
 fn probe_signal_recovery(out: &mut String) {
     unsafe {
+        // ① 注册 SIGSEGV / SIGBUS 处理器
         let act = SigAction {
             handler: segv_handler as usize,
             mask: 0,
             flags: 0,
         };
-        if sigaction(SIGSEGV, &act, std::ptr::null_mut()) != 0 {
-            writeln!(out, "[FAIL] ④ 注册 SIGSEGV 处理器失败 errno={}", *libc::__error()).unwrap();
-            return;
+        let mut ok_count = 0;
+        for sig in [SIGSEGV, SIGBUS] {
+            if sigaction(sig, &act, std::ptr::null_mut()) == 0 {
+                ok_count += 1;
+            } else {
+                writeln!(out, "[FAIL] ④ 注册信号 {sig} 处理器失败 errno={}", *libc::__error()).unwrap();
+            }
+        }
+        if ok_count == 2 {
+            writeln!(out, "[OK]   ④-a 可以注册 SIGSEGV / SIGBUS 处理器（NCE 的异常拦截机制可用）").unwrap();
         }
 
-        // 触发一次 SIGSEGV，处理器里 longjmp 回来 —— 这就是 NCE 拦截客户机异常后的续跑方式
-        if setjmp(JMPBUF.as_mut_ptr() as *mut c_void) == 0 {
-            raise(SIGSEGV);
-            writeln!(out, "[FAIL] ④ 信号没有送达处理器").unwrap();
-        } else if CAUGHT >= 1 {
-            writeln!(out, "[OK]   ④ 信号处理器可用，且能从中恢复（捕获 {CAUGHT} 次）").unwrap();
+        // ② 备用信号栈
+        let mut alt = libc::stack_t {
+            ss_sp: std::ptr::null_mut(),
+            ss_flags: 0,
+            ss_size: 0,
+        };
+        let stack_size = 64 * 1024;
+        let alt_stack = libc::mmap(
+            std::ptr::null_mut(),
+            stack_size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        );
+        if alt_stack != libc::MAP_FAILED {
+            alt.ss_sp = alt_stack;
+            alt.ss_size = stack_size;
+            if libc::sigaltstack(&alt, std::ptr::null_mut()) == 0 {
+                writeln!(out, "[OK]   ④-b 备用信号栈安装成功（64 KiB）").unwrap();
+            } else {
+                writeln!(out, "[FAIL] ④-b sigaltstack 失败 errno={}", *libc::__error()).unwrap();
+            }
         } else {
-            writeln!(out, "[FAIL] ④ 从信号处理器返回了，但计数异常").unwrap();
+            writeln!(out, "[FAIL] ④-b 给备用信号栈分配内存失败 errno={}", *libc::__error()).unwrap();
+        }
+
+        // ③ 自己发一个信号，确认能送到处理器（这一路完全不涉及跳转，不会崩）
+        let act2 = SigAction {
+            handler: usr1_handler as usize,
+            mask: 0,
+            flags: 0,
+        };
+        if sigaction(SIGUSR1, &act2, std::ptr::null_mut()) == 0 {
+            raise(SIGUSR1);
+            if USR1_HITS == 1 {
+                writeln!(out, "[OK]   ④-c 信号送达处理器（SIGUSR1 命中 1 次）").unwrap();
+            } else {
+                writeln!(out, "[FAIL] ④-c 信号没送到处理器（命中 {USR1_HITS} 次）").unwrap();
+            }
+        } else {
+            writeln!(out, "[FAIL] ④-c 注册 SIGUSR1 处理器失败 errno={}", *libc::__error()).unwrap();
         }
     }
 }
