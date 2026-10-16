@@ -14,15 +14,22 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <sys/ptrace.h>
 #include <sys/types.h>
 #include <unistd.h>
 
+// 注意：**iOS SDK 不提供 <sys/ptrace.h>**（符号在 libsystem_kernel 里，但头文件不随
+// iOS SDK 分发）。所以 ptrace 必须自己声明 —— RetroArch 的 JITSupport.m 就是这么做的。
+extern int ptrace(int request, pid_t pid, caddr_t addr, int data);
+
 #include <mach/exception_types.h>
 #include <mach/mach.h>
-#include <mach/mach_vm.h>
 #include <mach/thread_status.h>
+#if __has_include(<mach/vm_map.h>)
+#include <mach/vm_map.h>
+#endif
+#if __has_include(<mach/vm_region.h>)
 #include <mach/vm_region.h>
+#endif
 
 // ---------------------------------------------------------------- csops
 
@@ -51,15 +58,17 @@ int ruzu_page_protection(void *addr, size_t len) {
     if (addr == NULL || len == 0) {
         return -1;
     }
-    mach_vm_address_t address = (mach_vm_address_t)(uintptr_t)addr;
-    mach_vm_size_t size = 0;
+    vm_address_t address = (vm_address_t)(uintptr_t)addr;
+    vm_size_t size = 0;
     vm_region_basic_info_data_64_t info;
     mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
     mach_port_t object_name = MACH_PORT_NULL;
 
-    kern_return_t kr = mach_vm_region(mach_task_self(), &address, &size,
-                                      VM_REGION_BASIC_INFO_64,
-                                      (vm_region_info_t)&info, &count, &object_name);
+    // 用 vm_region_64（声明在 <mach/vm_map.h>，iOS SDK 一定有）。
+    // mach_vm_region 需要 <mach/mach_vm.h>，那个头在 iOS SDK 里不一定随附，故不用。
+    kern_return_t kr = vm_region_64(mach_task_self(), &address, &size,
+                                    VM_REGION_BASIC_INFO_64,
+                                    (vm_region_info_t)&info, &count, &object_name);
     if (kr != KERN_SUCCESS) {
         return -1;
     }
