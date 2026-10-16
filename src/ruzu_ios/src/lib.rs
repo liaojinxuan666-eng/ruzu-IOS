@@ -20,6 +20,8 @@
 use std::ffi::{c_char, c_int, c_void, CString};
 use std::fmt::Write as _;
 
+mod nce_probe;
+
 /// Darwin 的 `MAP_JIT`。不直接用 libc 常量，避免不同 libc 版本差异。
 const MAP_JIT: c_int = 0x0800;
 /// Darwin 的 `MAP_NORESERVE`。
@@ -296,6 +298,16 @@ pub extern "C" fn ruzu_ios_jit_probe() -> *mut c_char {
 #[no_mangle]
 pub extern "C" fn ruzu_ios_jit_probe_unsafe() -> *mut c_char {
     to_c_string(probe_unsigned())
+}
+
+/// NCE（原生执行）可行性预检。
+///
+/// 会做四件有副作用的事：MAP_FIXED 叠加 MAP_JIT 页、自修改代码、多线程独占
+/// 监视器压力测试、注册 SIGSEGV 处理器并从信号中恢复。因此可能闪退，UI 上
+/// 必须明确提示后再调。
+#[no_mangle]
+pub extern "C" fn ruzu_ios_nce_precheck() -> *mut c_char {
+    to_c_string(nce_probe::precheck())
 }
 
 #[no_mangle]

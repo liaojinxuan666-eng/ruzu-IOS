@@ -20,6 +20,10 @@ char *ruzu_ios_jit_probe(void);
 /// 越狱路径探测（裸 RWX / mprotect(RX)）。**没有 JIT 权限时可能直接闪退。**
 char *ruzu_ios_jit_probe_unsafe(void);
 
+/// NCE（原生执行）可行性预检。会做 MAP_FIXED+MAP_JIT、自修改代码、多线程
+/// 独占监视器、SIGSEGV 处理器实验。**可能闪退。**
+char *ruzu_ios_nce_precheck(void);
+
 /// 释放上面几个函数返回的字符串。
 void ruzu_ios_free_string(char *s);
 
