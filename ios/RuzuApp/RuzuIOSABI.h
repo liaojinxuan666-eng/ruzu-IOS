@@ -24,6 +24,10 @@ char *ruzu_ios_jit_probe_unsafe(void);
 /// 独占监视器、SIGSEGV 处理器实验。**可能闪退。**
 char *ruzu_ios_nce_precheck(void);
 
+/// 尝试「自持 JIT」（ptrace(PT_TRACE_ME) 让内核以为在被调试）。
+/// 尽力而为：iOS 26+ 内核已封这条路。成功后请重跑一次诊断。
+char *ruzu_ios_try_self_trace(void);
+
 /// 释放上面几个函数返回的字符串。
 void ruzu_ios_free_string(char *s);
 

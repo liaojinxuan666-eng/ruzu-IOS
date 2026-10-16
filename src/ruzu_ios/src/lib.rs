@@ -47,6 +47,26 @@ extern "C" {
     fn syscall(num: std::ffi::c_long, ...) -> c_int;
 }
 
+// 这些是同一 App 里用 C 实现的（ios/RuzuApp/JITEnable.c）——
+// Mach / 代码签名相关的结构体布局只有跟着 SDK 头文件走才不会错。
+extern "C" {
+    fn ruzu_cs_flags(out: *mut u32) -> c_int;
+    fn ruzu_page_protection(addr: *mut c_void, len: usize) -> c_int;
+    fn ruzu_prot_to_string(prot: c_int, out: *mut c_char, out_len: usize);
+    fn ruzu_try_self_trace(why: *mut c_char, why_len: usize) -> c_int;
+}
+
+/// 把权限位掩码转成 "RWX"/"R-X" 这样的人话。
+fn prot_str(prot: c_int) -> String {
+    let mut buf = [0 as c_char; 8];
+    unsafe {
+        ruzu_prot_to_string(prot, buf.as_mut_ptr(), buf.len());
+        std::ffi::CStr::from_ptr(buf.as_ptr())
+    }
+    .to_string_lossy()
+    .into_owned()
+}
+
 /// `csops` 的系统调用号（arm64 Darwin）。
 const SYS_CSOPS: std::ffi::c_long = 169;
 /// 查询代码签名标志位。
@@ -55,6 +75,8 @@ const CS_OPS_STATUS: c_int = 0;
 const CS_OPS_ENTITLEMENTS_BLOB: c_int = 7;
 /// 被调试器 attach 过 —— 有了它的进程才被允许用可执行内存。
 const CS_DEBUGGED: u32 = 0x1000_0000;
+/// 签名里带 get-task-allow（**不等于**"正在被调试"，别拿它当 JIT 判据）。
+const CS_GET_TASK_ALLOW: u32 = 0x0000_0004;
 
 unsafe fn csops(op: c_int, buf: *mut c_void, size: usize) -> c_int {
     syscall(
@@ -90,21 +112,20 @@ unsafe fn csops_entitlements() -> Option<String> {
     Some(String::from_utf8_lossy(&buf[..len]).into_owned())
 }
 
-/// 本进程到底有没有 JIT 资格 —— 纯靠代码签名状态判断，不做任何危险操作。
+/// 代码签名给出的「线索」。注意：**这些位不能直接当 JIT 判据**。
 ///
-/// 这就是「正确的检测方式」：**不要拿 `mmap(MAP_JIT)` 当判据**。
-/// 真机实测（iPhone11,6 / iOS 18.5）：即使 entitlements 齐全且 CS_DEBUGGED 置位，
-/// `mmap(MAP_JIT)` 依然 `errno=13 (EACCES)` —— 因为 **MAP_JIT 是 macOS 专有机制，
-/// iOS 内核不接受**。iOS 走的是「entitlements 授权 + 普通 RWX 匿名映射」。
-fn jit_qualification() -> (bool, bool, bool) {
-    // 返回 (是否具备 JIT 资格, 是否 CS_DEBUGGED, 是否有 dynamic-codesigning)
+/// 真机实测（iPhone11,6 / iOS 18.5）：`CS_DEBUGGED` 位是置上的（来自签名里的
+/// get-task-allow），但可执行内存依然拿不到 —— 内核在 mmap/mprotect 时会把
+/// EXEC 位剥掉。所以判据只能是「读页面真实权限」，见 `probe_official`。
+///
+/// 返回 (是否 CS_DEBUGGED, 是否带 get-task-allow, 是否有 dynamic-codesigning)
+fn codesign_hints() -> (bool, bool, bool) {
     unsafe {
-        let debugged = csops_status_flags().map_or(false, |f| f & CS_DEBUGGED != 0);
+        let flags = csops_status_flags().unwrap_or(0);
+        let debugged = flags & CS_DEBUGGED != 0;
+        let get_task_allow = flags & CS_GET_TASK_ALLOW != 0;
         let blob = csops_entitlements().unwrap_or_default();
-        let dyn_codesign = blob.contains("dynamic-codesigning");
-        let allow_jit = blob.contains("com.apple.security.cs.allow-jit")
-            || blob.contains("allow-unsigned-executable-memory");
-        (debugged || dyn_codesign || allow_jit, debugged, dyn_codesign)
+        (debugged, get_task_allow, blob.contains("dynamic-codesigning"))
     }
 }
 
@@ -126,12 +147,13 @@ fn codesign_report() -> String {
                 writeln!(out, "代码签名标志: 0x{flags:08x}").unwrap();
                 // 位含义取自 XNU cs_blobs.h，只解码几个与 JIT 相关的
                 let bits = [
+                    (CS_GET_TASK_ALLOW, "CS_GET_TASK_ALLOW(签名带 get-task-allow)"),
                     (0x0000_0100u32, "CS_HARD"),
                     (0x0000_0200, "CS_KILL"),
                     (0x0000_0800, "CS_RESTRICT"),
                     (0x0000_2000, "CS_REQUIRE_LV"),
                     (0x0400_0000, "CS_PLATFORM_BINARY"),
-                    (0x1000_0000, "CS_DEBUGGED"),
+                    (CS_DEBUGGED, "CS_DEBUGGED(运行时被调试过)"),
                 ];
                 let mut names = Vec::new();
                 for (bit, name) in bits {
@@ -139,13 +161,8 @@ fn codesign_report() -> String {
                         names.push(name);
                     }
                 }
-                writeln!(
-                    out,
-                    "  置位: {}{}",
-                    if names.is_empty() { "（无已知位）".to_string() } else { names.join(" ") },
-                    if flags & CS_DEBUGGED != 0 { "  ← 有 JIT 资格" } else { "" }
-                )
-                .unwrap();
+                writeln!(out, "  置位: {}", if names.is_empty() { "（无已知位）".to_string() } else { names.join(" ") }).unwrap();
+                writeln!(out, "  提示: 上面这些位**不足以判定 JIT 可用性** —— 真机上它们全置位，\n        可执行内存照样拿不到。真正的判据看下面「真实页面权限」。").unwrap();
             }
             None => writeln!(out, "csops(STATUS) 失败 errno={}（沙盒拦了 syscall？）", *libc::__error()).unwrap(),
         }
@@ -326,116 +343,184 @@ fn describe(result: Result<u32, i32>) -> String {
     }
 }
 
-/// 官方路径探针。
+/// JIT 通路探针 —— 核心思路：**先读页面的真实权限，再决定要不要执行**。
 ///
-/// **真机实测结论（iPhone11,6 / iOS 18.5，2026-10-17）**：
-/// * macOS(arm64) 的姿势是 `mmap(MAP_JIT)` + `pthread_jit_write_protect_np` 翻转；
-/// * **iOS 根本不接受 MAP_JIT**（RWX+MAP_JIT → EINVAL，RW+MAP_JIT → EACCES），
-///   iOS SDK 里也没有 `pthread_jit_write_protect_np` 这个符号；
-/// * iOS 的正确姿势是：**普通 RWX 匿名映射**，可执行性由代码签名授权
-///   （`dynamic-codesigning` entitlement / `CS_DEBUGGED`）。
-///
-/// 所以这里先按 iOS 姿势来，并且**执行前先查代码签名资格**：没资格就不执行，
-/// 免得拿你的 App 冒闪退风险（无授权时执行 RWX 页必然 SIGBUS，已实测）。
+/// 为什么必须这样：内核允许你 `mmap` 请求 `PROT_EXEC`，但在没有 JIT 授权时会于
+/// 建立映射时**悄悄剥掉 EXEC 位**（Apple 的 W^X 策略）。页表面上是 RWX，一执行就
+/// SIGBUS —— 这正是我们连续两次闪退的原因。用 `mach_vm_region` 读真实权限则完全
+/// 无害：不执行任何东西就能得到结论，也不会再拿 App 冒险。
 fn probe_official() -> String {
     let mut out = String::new();
     let len = 4096usize;
     let rw = libc::PROT_READ | libc::PROT_WRITE;
+    let rx = libc::PROT_READ | libc::PROT_EXEC;
     let rwx = rw | libc::PROT_EXEC;
-    let (jit_ok, debugged, dyn_codesign) = jit_qualification();
+    let (debugged, get_task_allow, dyn_codesign) = codesign_hints();
+    let mut executed = false;
 
     unsafe {
-        // ---------- 路径 1：iOS 姿势（普通 RWX 匿名映射） ----------
+        writeln!(
+            out,
+            "签名线索: CS_DEBUGGED={debugged} get-task-allow={get_task_allow} dynamic-codesigning={dyn_codesign}（仅供参考，不作判据）"
+        )
+        .unwrap();
+        writeln!(out, "真实页面权限（对照内核实际给了什么）：").unwrap();
+
+        // ---------- 方案 A：直接请求 RWX ----------
         match mmap_region(len, rwx, false) {
             Ok(p) => {
-                writeln!(out, "[OK]  mmap(RWX，不带 MAP_JIT) 成功 @ {p:p}").unwrap();
-                if jit_ok {
-                    writeln!(
-                        out,
-                        "[OK]  代码签名已授权 JIT（CS_DEBUGGED={debugged} / dynamic-codesigning={dyn_codesign}），开始执行测试"
-                    )
-                    .unwrap();
+                let prot = ruzu_page_protection(p, len);
+                writeln!(out, "  A. mmap(RWX) → 实际 {}", prot_str(prot)).unwrap();
+                if prot >= 0 && prot & 4 != 0 {
                     jitmem::write_code_raw(p, &PROBE_CODE);
                     let r = call_code(p);
-                    if r == PROBE_EXPECT {
-                        writeln!(out, "[OK]  ★ 机器码真的执行了（返回 {r}）—— iOS 的 JIT 通路就是这条").unwrap();
-                    } else {
-                        writeln!(out, "[??]  执行了但返回 {r}（期望 {PROBE_EXPECT}）").unwrap();
-                    }
-                } else {
-                    writeln!(
-                        out,
-                        "[SKIP] 代码签名未授权 JIT（CS_DEBUGGED={debugged} / dynamic-codesigning={dyn_codesign}），跳过执行\n\
-                         　　　无授权时执行可执行页必然 SIGBUS（已实测），不拿你的 App 冒险"
-                    )
-                    .unwrap();
+                    report_exec(&mut out, "A", r);
+                    executed = true;
                 }
                 libc::munmap(p, len);
             }
-            Err(e) => writeln!(out, "[FAIL] mmap(RWX，不带 MAP_JIT) 失败 errno={e}").unwrap(),
+            Err(e) => writeln!(out, "  A. mmap(RWX) → errno={e}").unwrap(),
         }
 
-        // ---------- 路径 2：macOS 姿势（MAP_JIT），只作对照 ----------
-        writeln!(out, "对照（macOS 的 MAP_JIT 姿势在 iOS 上）：").unwrap();
-        for (label, prot) in [("RW  + MAP_JIT", rw), ("RWX + MAP_JIT", rwx)] {
-            match mmap_region(len, prot, true) {
+        // ---------- 方案 B：RW → 写入 → mprotect(RX)（W^X 安全的经典写法）----------
+        if !executed {
+            match mmap_region(len, rw, false) {
                 Ok(p) => {
-                    writeln!(out, "  {label} → [OK]（意外，iOS 上通常失败）").unwrap();
+                    let prot_rw = ruzu_page_protection(p, len);
+                    let mr = libc::mprotect(p, len, rx);
+                    let prot_rx = ruzu_page_protection(p, len);
+                    writeln!(
+                        out,
+                        "  B. mmap(RW)={} → mprotect(RX)={} → 实际 {}",
+                        prot_str(prot_rw),
+                        if mr == 0 { "OK".to_string() } else { format!("errno={}", *libc::__error()) },
+                        prot_str(prot_rx)
+                    )
+                    .unwrap();
+                    if prot_rx >= 0 && prot_rx & 4 != 0 {
+                        // 写入前先改回可写
+                        if libc::mprotect(p, len, rw) == 0 {
+                            jitmem::write_code_raw(p, &PROBE_CODE);
+                            if libc::mprotect(p, len, rx) == 0 {
+                                let r = call_code(p);
+                                report_exec(&mut out, "B", r);
+                                executed = true;
+                            }
+                        }
+                    }
                     libc::munmap(p, len);
                 }
-                Err(e) => writeln!(out, "  {label} → errno={e}（符合预期：iOS 不支持 MAP_JIT）").unwrap(),
+                Err(e) => writeln!(out, "  B. mmap(RW) → errno={e}").unwrap(),
             }
+        }
+
+        // ---------- 结论 ----------
+        if executed {
+            writeln!(out, "[OK]  ★ 可执行内存可用，机器码真的执行了 —— JIT 通路已打通。").unwrap();
+        } else {
+            writeln!(
+                out,
+                "[FAIL] 请求了 RWX/RX，内核实际给回来都没有 X 位 → 本进程当前没有 JIT 权限。\n\
+                 　　　（这个结论来自**读页面真实权限**，不是靠闪退试出来的）\n\
+                 　　　下一步：\n\
+                 　　　　· 越狱 / TrollStore：先点「⑤ 自持 JIT」试试（老系统可能直接成功）\n\
+                 　　　　· 其它情况：用 StikDebug / SideStore 给本 App 开 JIT（等于挂个调试器）后重开本 App"
+            )
+            .unwrap();
         }
     }
     out
 }
 
-/// 越狱路径：裸 RWX、以及 RW → mprotect(RX)。**可能闪退**，故单独入口。
+fn report_exec(out: &mut String, tag: &str, r: u32) {
+    if r == PROBE_EXPECT {
+        writeln!(out, "[OK]  {tag}. 执行返回 {r} ✓").unwrap();
+    } else {
+        writeln!(out, "[??]  {tag}. 执行返回 {r}（期望 {PROBE_EXPECT}）").unwrap();
+    }
+}
+
+/// 越狱路径对照：把几种「拿可执行内存」的映射方式都试一遍，**只报真实权限**，
+/// 只有在真实权限里确实有 X 时才执行（所以这个按钮现在也不会闪退了）。
 fn probe_unsigned() -> String {
     let mut out = String::new();
     let len = 4096usize;
     let rw = libc::PROT_READ | libc::PROT_WRITE;
-    let rwx = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
+    let rx = libc::PROT_READ | libc::PROT_EXEC;
+    let rwx = rw | libc::PROT_EXEC;
 
-    // 判据改成「代码签名资格」，而不是 mmap(MAP_JIT) ——
-    // 后者在 iOS 上永远失败，用它当判据会让这个按钮永远跳过。
-    let (jit_ok, debugged, dyn_codesign) = jit_qualification();
-    if !jit_ok {
-        out.push_str(&format!(
-            "[跳过] 代码签名未授权 JIT（CS_DEBUGGED={debugged} / dynamic-codesigning={dyn_codesign}）。\n\
-             无授权时执行可执行页必然 SIGBUS（真机已实测），所以不再尝试。\n\
-             请先把 JIT 权限搞定，再回来点这个按钮。\n"
-        ));
-        return out;
-    }
     unsafe {
-        // 路径 B：裸 RWX，无 MAP_JIT、无写保护（这条就是"直接硬写"，越狱环境才有）
-        match mmap_region(len, rwx, false) {
-            Ok(p) => {
-                jitmem::write_code_raw(p, &PROBE_CODE);
-                let r = call_code(p);
-                writeln!(out, "[{}] 裸 RWX（无 MAP_JIT）：{}", if r == PROBE_EXPECT { "OK" } else { "??" }, describe(Ok(r))).unwrap();
-                libc::munmap(p, len);
+        writeln!(out, "各映射方式的真实权限（请求 → 内核实际给）：").unwrap();
+
+        for (label, prot, map_jit) in [
+            ("裸 RWX（无 MAP_JIT）", rwx, false),
+            ("RW + MAP_JIT", rw, true),
+            ("RWX + MAP_JIT", rwx, true),
+        ] {
+            match mmap_region(len, prot, map_jit) {
+                Ok(p) => {
+                    let real = ruzu_page_protection(p, len);
+                    writeln!(out, "  {label:22} → mmap OK，实际 {}", prot_str(real)).unwrap();
+                    if real >= 0 && real & 4 != 0 && prot & 4 != 0 {
+                        jitmem::write_code_raw(p, &PROBE_CODE);
+                        let r = call_code(p);
+                        report_exec(&mut out, label, r);
+                    }
+                    libc::munmap(p, len);
+                }
+                Err(e) => writeln!(out, "  {label:22} → mmap 失败 errno={e}").unwrap(),
             }
-            Err(e) => writeln!(out, "[FAIL] mmap(RWX, 无 MAP_JIT) 失败 errno={e}").unwrap(),
         }
 
-        // 路径 C：RW 写入 → mprotect(RX) → 执行
+        // RW → mprotect(RX)
         match mmap_region(len, rw, false) {
             Ok(p) => {
-                jitmem::write_code_raw(p, &PROBE_CODE);
-                if libc::mprotect(p, len, libc::PROT_READ | libc::PROT_EXEC) == 0 {
-                    let r = call_code(p);
-                    writeln!(out, "[{}] RW → mprotect(RX) → 执行：{}", if r == PROBE_EXPECT { "OK" } else { "??" }, describe(Ok(r))).unwrap();
-                } else {
-                    writeln!(out, "[FAIL] mprotect(PROT_EXEC) 失败 errno={}", *libc::__error()).unwrap();
+                let mr = libc::mprotect(p, len, rx);
+                let real = ruzu_page_protection(p, len);
+                writeln!(
+                    out,
+                    "  RW → mprotect(RX)      → mprotect {}，实际 {}",
+                    if mr == 0 { "OK".to_string() } else { format!("errno={}", *libc::__error()) },
+                    prot_str(real)
+                )
+                .unwrap();
+                if real >= 0 && real & 4 != 0 {
+                    if libc::mprotect(p, len, rw) == 0 {
+                        jitmem::write_code_raw(p, &PROBE_CODE);
+                        if libc::mprotect(p, len, rx) == 0 {
+                            let r = call_code(p);
+                            report_exec(&mut out, "RW→RX", r);
+                        }
+                    }
                 }
                 libc::munmap(p, len);
             }
-            Err(e) => writeln!(out, "[FAIL] mmap(RW) 失败 errno={e}").unwrap(),
+            Err(e) => writeln!(out, "  RW → mprotect(RX)      → mmap 失败 errno={e}").unwrap(),
         }
     }
     out
+}
+
+/// 尝试「自持 JIT」（照 RetroArch / UTM 的 ptrace hack）。
+///
+/// **明确标注为尽力而为**：这条路的可用性随系统版本变化，iOS 26+ 内核已封。
+/// 真正稳妥的路线仍是「挂调试器」（StikDebug / AltStore / Xcode）。
+#[no_mangle]
+pub extern "C" fn ruzu_ios_try_self_trace() -> *mut c_char {
+    let mut buf = vec![0 as c_char; 1024];
+    let rc = unsafe { ruzu_try_self_trace(buf.as_mut_ptr(), buf.len()) };
+    let why = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
+    let mut out = String::new();
+    if rc == 0 {
+        writeln!(out, "[OK] 自持 JIT 调用成功。").unwrap();
+    } else {
+        writeln!(out, "[FAIL] 自持 JIT 失败（rc={rc}）。").unwrap();
+    }
+    out.push_str(&why);
+    out.push_str("\n\n请重新点「① 运行诊断」看「真实页面权限」有没有变成带 X。");
+    to_c_string(out)
 }
 
 /// 试各种尺寸的 PROT_NONE 预留，看 iOS 允许多大的客户机 VA。
@@ -504,23 +589,18 @@ pub extern "C" fn ruzu_ios_diagnostics() -> *mut c_char {
     writeln!(s, "\n=== 客户机内存预留（PROT_NONE + MAP_NORESERVE）===").unwrap();
     s.push_str(&probe_reservation());
     writeln!(s, "\n=== 判定 ===").unwrap();
-    let (jit_ok, debugged, dyn_codesign) = jit_qualification();
     if jit.contains('★') {
         writeln!(s, "→ JIT 通路已打通：机器码真的执行了。地基全齐，可以开始接 ruzu 核心了。").unwrap();
-    } else if jit_ok {
+    } else if jit.contains("没有 JIT 权限") {
         writeln!(
             s,
-            "→ 代码签名已授权 JIT（CS_DEBUGGED={debugged} / dynamic-codesigning={dyn_codesign}），\n\
-             　 但执行测试没成功 —— 把上面「JIT 通路」一节的原文发出来定位。"
+            "→ 本进程当前没有 JIT 权限（内核剥掉了 EXEC 位）。\n\
+             \x20  越狱/TrollStore：点「⑤ 自持 JIT」再重测；\n\
+             \x20  其它环境：用 StikDebug / SideStore 开 JIT 后重开本 App（等于挂个调试器）。"
         )
         .unwrap();
     } else {
-        writeln!(
-            s,
-            "→ 还没有 JIT 权限（CS_DEBUGGED={debugged} / dynamic-codesigning={dyn_codesign}）。\n\
-             　 越狱/TrollStore 环境：用带 entitlements 的 IPA，或在设备上用 ldid 重签（见 README）。"
-        )
-        .unwrap();
+        writeln!(s, "→ JIT 状态未定，把上面「JIT 通路」一节的原文发出来定位。").unwrap();
     }
     to_c_string(s)
 }

@@ -55,29 +55,42 @@ iOS 的「文件」App 建不了 `.` 开头的文件夹，所以 `.github/workfl
 
 ---
 
-## 二、装到手机上（不越狱路线）
+## 二、JIT 怎么开（2026-10-17 真机实测后的结论）
 
-1. 用 **SideStore**（或 AltStore）侧载 `Ruzu-unsigned.ipa`，它用你的开发者证书重签。
-   侧载时**不要**套 `Ruzu-jailbreak.entitlements` —— 里面有普通证书没有授权的键，装了会失败。
-2. **JIT 要单独开**（这是唯一一道硬门槛）：
-   免费证书签出来的 App 默认没有可执行内存权限。在设备上装 **StikDebug**（或同类工具），
-   在启动 ruzu **之前**先给 ruzu 开 JIT。原理是让调试器 attach 本进程，
-   进程被标成 `CS_DEBUGGED` 后 `mmap(MAP_JIT)` 就放行了。
-3. 打开 App →「① 运行诊断」，看 JIT 那一行：
-   - `[OK] MAP_JIT + 写保护` → 通了；
-   - `[FAIL] ... errno=1/12` → JIT 没开成功，回到第 2 步重开一次再启动 App。
+先说两条**已经证伪**的假设，省得再走弯路：
 
-> 越狱设备同样可以走这条路（当前主路线），越狱只用来换取更大的内存上限和更少的签名麻烦。
+| 假设 | 真机结果（iPhone11,6 / iOS 18.5） |
+|---|---|
+| 「用 `mmap(MAP_JIT)` + `pthread_jit_write_protect_np`」 | ❌ **iOS 根本不支持 MAP_JIT**：RWX+MAP_JIT → EINVAL，RW+MAP_JIT → EACCES；SDK 里也没有那个符号。那是 macOS 专有机制 |
+| 「有 `dynamic-codesigning` + `CS_DEBUGGED` 就能执行 RWX 页」 | ❌ entitlements 齐全（654 字节 XML，四个键都在）、CS_DEBUGGED 也置位，但**内核在 mmap 时会把 EXEC 位悄悄剥掉**，一执行就 SIGBUS |
 
-## 三、越狱路线（可选，不作为主路线）
+**正确的判定方式**：不去"执行试试看"，而是用 `mach_vm_region` **读页面的真实权限**
+（App 里的「① 运行诊断 → 真实页面权限」就是这么做的）。请求 RWX、实际拿到 `RW-`，
+就说明本进程没有 JIT 权限 —— 这个过程永远不会闪退。
 
-1. **TrollStore** 安装同一个 IPA，然后用越狱 entitlements 重签：
-   ```
-   ldid -SRuzuApp-jailbreak.entitlements Ruzu.app/Ruzu
-   ```
-2. 打开 App →「① 运行诊断」；官方路径不通再点「③ 越狱路径探测」。
+**怎么拿到 JIT**（两条路，按环境选）：
 
-「③ 越狱路径探测」在**没有** JIT 权限时可能直接闪退 —— 这是预期结果，闪退本身就是结论。重开 App 即可。
+1. **挂调试器（通用，也是 StikDebug 的原理）**
+   用 StikDebug / SideStore / AltStore 给本 App「开 JIT」，或直接用 Xcode 跑。
+   本质是让调试器 attach 本进程，内核随后才允许可执行内存。
+2. **自持 JIT（越狱 / 老系统，尽力而为）**
+   点 App 里的「⑤ 自持 JIT」：给进程自己发 `ptrace(PT_TRACE_ME)`，骗内核以为在被 Xcode 调试
+   （做法照抄 RetroArch `pkg/apple/JITSupport.m` 与 PPSSPP `ios/main.mm`）。
+   **注意**：这条路随系统版本变化 —— RetroArch 里明确写了 `apple_runtime_available(0, 26.0, 0)` 时跳过，
+   即 **iOS 26+ 内核已封**。所以它是"能成就赚到"，不是保底方案。
+
+开完之后回到「① 运行诊断」，「真实页面权限」应当从 `RW-` 变成带 `X`，并出现
+`★ 可执行内存可用，机器码真的执行了`。
+
+> 另外：`Ruzu-jailbreak.entitlements` 里那两条（`increased-memory-limit`、
+> `extended-virtual-addressing`）是**真的有用**的 —— 签名带上之后，jetsam 上限从
+> 2.04 → 2.28 GiB，客户机 VA 预留从「8 GiB」变成「16 GiB 也能成」。
+
+## 三、侧载方式
+
+- **越狱 / TrollStore**：直接装带 entitlements 的 `Ruzu-jailbreak.ipa`（CI 已经 ad-hoc 签名并嵌入权限）。
+- **不越狱**：SideStore / AltStore 侧载 `Ruzu-unsigned.ipa`，**不要**套 jailbreak 那份 entitlements
+  （里面有普通证书没授权的键，装了会失败）。
 
 ---
 

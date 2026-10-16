@@ -25,4 +25,7 @@ enum RuzuFFI {
 
     /// NCE 可行性预检。可能闪退。
     static var ncePrecheck: String { take(ruzu_ios_nce_precheck()) }
+
+    /// 尝试自持 JIT（ptrace hack）。不会闪退。
+    static var trySelfTrace: String { take(ruzu_ios_try_self_trace()) }
 }

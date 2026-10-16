@@ -78,13 +78,13 @@ unsafe fn mmap_reserve(len: usize) -> Result<*mut u8, i32> {
     }
 }
 
-/// 开一个 MAP_JIT 的 RWX 页。
+/// 开一段可执行页。
 ///
-/// `fixed` 为真时用 MAP_FIXED 把它叠在已预留的 VA 上（模拟 NCE 把客户机
-/// 代码段变成可执行映射）；为假时让内核随便挑地址。
-/// 注意：MAP_FIXED + 空地址是非法的，所以两种情况必须分开。
+/// iOS 不支持 MAP_JIT（真机实测 EINVAL/EACCES），所以这里用**普通匿名 RWX 映射**，
+/// 再用 `ruzu_page_protection` 读回内核的**真实**权限 —— 只有真的带 X 才执行，
+/// 避免把探测变成闪退。
 unsafe fn mmap_jit(addr: *mut u8, len: usize, fixed: bool) -> Result<*mut u8, i32> {
-    let mut flags = libc::MAP_PRIVATE | libc::MAP_ANON | MAP_JIT;
+    let mut flags = libc::MAP_PRIVATE | libc::MAP_ANON;
     if fixed {
         flags |= libc::MAP_FIXED;
     }
@@ -101,6 +101,12 @@ unsafe fn mmap_jit(addr: *mut u8, len: usize, fixed: bool) -> Result<*mut u8, i3
     } else {
         Ok(p as *mut u8)
     }
+}
+
+/// 内核实际给了可执行权限吗？（见 RuzuJIT.h 的说明）
+unsafe fn page_executable(p: *mut u8, len: usize) -> bool {
+    let prot = crate::ruzu_page_protection(p as *mut c_void, len);
+    prot >= 0 && prot & 4 != 0
 }
 
 /// 往 JIT 内存写机器码。写保护切换（或 mprotect 降级）由 `crate::jitmem` 统一处理。
@@ -127,7 +133,18 @@ fn probe_executable_guest_va(out: &mut String) {
                 let target = base.add(RESERVE / 2);
                 match mmap_jit(target, PAGE, true) {
                     Ok(p) => {
-                        writeln!(out, "[OK]   ①-b 在预留区内 MAP_FIXED 叠加 MAP_JIT RWX 页 @ {p:p}").unwrap();
+                        writeln!(out, "[OK]   ①-b 在预留区内 MAP_FIXED 叠加 RWX 页 @ {p:p}").unwrap();
+                        if !page_executable(p, PAGE) {
+                            writeln!(
+                                out,
+                                "[FAIL] ①-c 内核把 X 位剥掉了（本进程没有 JIT 权限）→ 不执行，免得闪退\n\
+                                 　　　→ 先把 JIT 开了再来测 NCE（见①诊断的结论）"
+                            )
+                            .unwrap();
+                            libc::munmap(p as *mut c_void, PAGE);
+                            libc::munmap(base as *mut c_void, RESERVE);
+                            return;
+                        }
 
                         // 顺手真执行一条，确认不是"能映射但跑不了"
                         match write_code_at(p, PAGE, &encode_return_imm(7)) {
@@ -172,6 +189,11 @@ fn probe_self_modifying(out: &mut String) {
                 return;
             }
             Ok(p) => {
+                if !page_executable(p, 64 * 1024) {
+                    writeln!(out, "[FAIL] ② 页面没有 X 权限（没有 JIT），跳过").unwrap();
+                    libc::munmap(p as *mut c_void, 64 * 1024);
+                    return;
+                }
                 if let Err(e) = write_code_at(p, 64 * 1024, &CODE_RET_1) {
                     writeln!(out, "[FAIL] ② JIT 页无法写入：{e}").unwrap();
                     libc::munmap(p as *mut c_void, 64 * 1024);
@@ -210,6 +232,11 @@ fn probe_exclusive_monitor(out: &mut String) {
         };
 
         // 代码页 + 数据（放在同一页的后半部分，避开代码）
+        if !page_executable(page, 64 * 1024) {
+            writeln!(out, "[FAIL] ③ 页面没有 X 权限（没有 JIT），跳过").unwrap();
+            libc::munmap(page as *mut c_void, 64 * 1024);
+            return;
+        }
         if let Err(e) = write_code_at(page, 64 * 1024, &CODE_RMW) {
             writeln!(out, "[FAIL] ③ JIT 页无法写入：{e}").unwrap();
             libc::munmap(page as *mut c_void, 64 * 1024);

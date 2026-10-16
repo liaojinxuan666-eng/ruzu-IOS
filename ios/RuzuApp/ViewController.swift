@@ -47,16 +47,19 @@ final class ViewController: UIViewController {
         metal.addTarget(self, action: #selector(runMetalSelfTest), for: .touchUpInside)
 
         let unsigned = UIButton(type: .system)
-        unsigned.setTitle("③ 越狱路径探测（可能闪退）", for: .normal)
-        unsigned.setTitleColor(.systemRed, for: .normal)
+        unsigned.setTitle("③ 映射方式对照（越狱）", for: .normal)
         unsigned.addTarget(self, action: #selector(runUnsignedProbe), for: .touchUpInside)
 
         let nce = UIButton(type: .system)
-        nce.setTitle("④ NCE 预检（可能闪退）", for: .normal)
+        nce.setTitle("④ NCE 预检（含执行测试）", for: .normal)
         nce.setTitleColor(.systemRed, for: .normal)
         nce.addTarget(self, action: #selector(runNCEPrecheck), for: .touchUpInside)
 
-        let buttons = UIStackView(arrangedSubviews: [safe, metal, unsigned, nce])
+        let selfTrace = UIButton(type: .system)
+        selfTrace.setTitle("⑤ 自持 JIT（越狱/老系统）", for: .normal)
+        selfTrace.addTarget(self, action: #selector(runSelfTrace), for: .touchUpInside)
+
+        let buttons = UIStackView(arrangedSubviews: [safe, metal, unsigned, nce, selfTrace])
         buttons.axis = .vertical
         buttons.spacing = 8
 
@@ -100,23 +103,12 @@ final class ViewController: UIViewController {
     }
 
     @objc private func runUnsignedProbe() {
-        let alert = UIAlertController(
-            title: "越狱路径探测",
-            message: """
-            这会尝试执行「裸 RWX」和「RW → mprotect(RX)」这两种可执行内存。
-            如果本 App 没有 JIT 权限，**它可能直接闪退** —— 闪退本身就是结论：
-            说明这条路也走不通（重开 App 即可）。
-
-            越狱环境下请点「继续」。
-            """,
-            preferredStyle: .alert
-        )
-        alert.addAction(UIAlertAction(title: "取消", style: .cancel))
-        alert.addAction(UIAlertAction(title: "继续", style: .destructive) { [weak self] _ in
-            self?.reset("越狱路径探测")
-            self?.append(RuzuFFI.jitProbeUnsigned)
-        })
-        present(alert, animated: true)
+        reset("映射方式对照")
+        // 现在这一步只"读真实权限"，只有在真实权限里确实有 X 时才执行 → 不会闪退
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let report = RuzuFFI.jitProbeUnsigned
+            DispatchQueue.main.async { self?.append(report) }
+        }
     }
 
     @objc private func runMetalSelfTest() {
@@ -126,17 +118,24 @@ final class ViewController: UIViewController {
         append(MetalProbe.run(layer: previewView.metalLayer))
     }
 
+    @objc private func runSelfTrace() {
+        reset("自持 JIT")
+        append(RuzuFFI.trySelfTrace)
+        append("\n（如果成功，请重新点「① 运行诊断」，看「真实页面权限」里有没有出现 X）")
+    }
+
     @objc private func runNCEPrecheck() {
         let alert = UIAlertController(
             title: "NCE 可行性预检",
             message: """
-            会有四组实验，其中两组比较激进：
-            · 在预留的客户机 VA 里 MAP_FIXED 叠加可执行页
+            四组实验：
+            · 在预留的客户机 VA 里映射可执行页（先读真实权限，没 X 就跳过）
             · 自修改代码后立刻重执行
             · 4 线程独占监视器（LDXR/STXR）压力测试
-            · 注册 SIGSEGV 处理器并从信号中恢复
+            · 信号处理器（SIGSEGV/SIGBUS 注册、备用信号栈、信号送达）
 
-            没有 JIT 权限时可能闪退 —— 闪退本身就是结论，重开 App 即可。
+            没有 JIT 权限时前两组会被自动跳过（不会闪退），只会报告"NCE 需要 JIT"。
+            先跑①确认 JIT 已通，这里的结论才有意义。
             """,
             preferredStyle: .alert
         )
@@ -145,7 +144,6 @@ final class ViewController: UIViewController {
             guard let self else { return }
             self.reset("NCE 预检")
             self.append("运行中（多线程独占监视器测试可能要几秒）…")
-            // 信号处理器的 setjmp/longjmp 必须与调用同线程，所以整段放在同一个队列里跑
             DispatchQueue.global(qos: .userInitiated).async {
                 let report = RuzuFFI.ncePrecheck
                 DispatchQueue.main.async { self.append(report) }
