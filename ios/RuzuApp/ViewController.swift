@@ -17,6 +17,7 @@ final class ViewController: UIViewController {
         super.viewDidLoad()
         title = "ruzu iOS · 诊断"
         view.backgroundColor = .systemBackground
+        RuzuFFI.configureLogPath()
         buildUI()
     }
 
@@ -59,7 +60,11 @@ final class ViewController: UIViewController {
         selfTrace.setTitle("⑤ 自持 JIT（越狱/老系统）", for: .normal)
         selfTrace.addTarget(self, action: #selector(runSelfTrace), for: .touchUpInside)
 
-        let buttons = UIStackView(arrangedSubviews: [safe, metal, unsigned, nce, selfTrace])
+        let logButton = UIButton(type: .system)
+        logButton.setTitle("⑥ 查看探测日志", for: .normal)
+        logButton.addTarget(self, action: #selector(showProbeLog), for: .touchUpInside)
+
+        let buttons = UIStackView(arrangedSubviews: [safe, metal, unsigned, nce, selfTrace, logButton])
         buttons.axis = .vertical
         buttons.spacing = 8
 
@@ -124,18 +129,23 @@ final class ViewController: UIViewController {
         append("\n（如果成功，请重新点「① 运行诊断」，看「真实页面权限」里有没有出现 X）")
     }
 
+    @objc private func showProbeLog() {
+        reset("探测日志")
+        append(RuzuFFI.log)
+    }
+
     @objc private func runNCEPrecheck() {
         let alert = UIAlertController(
             title: "NCE 可行性预检",
             message: """
             四组实验：
-            · 在预留的客户机 VA 里映射可执行页（先读真实权限，没 X 就跳过）
+            · 在预留的客户机 VA 里映射可执行页（先 RW → 写入 → mprotect(RX) → 才执行）
             · 自修改代码后立刻重执行
             · 4 线程独占监视器（LDXR/STXR）压力测试
             · 信号处理器（SIGSEGV/SIGBUS 注册、备用信号栈、信号送达）
 
-            没有 JIT 权限时前两组会被自动跳过（不会闪退），只会报告"NCE 需要 JIT"。
-            先跑①确认 JIT 已通，这里的结论才有意义。
+            每一步执行前都会先写进 Documents/nce_probe.log —— 万一闪退，
+            重开 App 点「⑥ 查看探测日志」就能看到崩在哪一步。
             """,
             preferredStyle: .alert
         )

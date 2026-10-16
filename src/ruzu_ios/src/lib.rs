@@ -249,6 +249,51 @@ fn codesign_report() -> String {
     out
 }
 
+// ---------------------------------------------------------------- 探测日志
+//
+// 真机上的危险探测一旦闪退，界面上的输出就看不到了。所以把关键步骤**先写进文件**
+// 再执行：崩了之后打开 App 的 Documents/nce_probe.log 就能看到崩在哪一步。
+// 日志路径由 Swift 侧在启动时通过 ruzu_ios_set_log_path 传进来。
+
+static LOG_PATH: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+
+#[no_mangle]
+pub extern "C" fn ruzu_ios_set_log_path(path: *const c_char) {
+    if path.is_null() {
+        return;
+    }
+    let p = unsafe { std::ffi::CStr::from_ptr(path) }
+        .to_string_lossy()
+        .into_owned();
+    if let Ok(mut g) = LOG_PATH.lock() {
+        *g = Some(std::path::PathBuf::from(p));
+    }
+}
+
+/// 追加一行到探测日志（没有配置路径、或写失败时静默忽略）。
+pub(crate) fn log_line(msg: &str) {
+    use std::io::Write;
+    if let Ok(g) = LOG_PATH.lock() {
+        if let Some(p) = g.as_ref() {
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                let _ = writeln!(f, "{msg}");
+            }
+        }
+    }
+}
+
+/// 把探测日志读出来给界面显示。
+#[no_mangle]
+pub extern "C" fn ruzu_ios_read_log() -> *mut c_char {
+    let text = LOG_PATH
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_else(|| "（还没有日志，先点一次 ① 或 ④）".to_string());
+    to_c_string(text)
+}
+
 // ---------------------------------------------------------------- 内部工具
 
 fn to_c_string(s: String) -> *mut c_char {

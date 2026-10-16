@@ -237,9 +237,14 @@ _RH_MMAP_NEW = '''unsafe fn mmap_code_cache(size: usize) -> Result<NonNull<u8>, 
     {
         let anon = libc::MAP_PRIVATE | libc::MAP_ANON;
         let jit = anon | libc::MAP_JIT;
-        let rwx = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
         let rw = libc::PROT_READ | libc::PROT_WRITE;
-        for (prot, flags) in [(rwx, anon), (rwx, jit), (rw, jit)] {
+        let rwx = rw | libc::PROT_EXEC;
+        // 真机实测：**一次性请求 RWX 会被内核剥掉 X 位**（W^X），页看着是 RWX 实际是 RW-。
+        // 所以 iOS 上优先按 RW 映射（可写），可执行性交给后续的 mprotect(RX)。
+        // 注：代码缓存的 W^X 翻转策略是下一步的工程任务 —— 每个块 emit 前后翻转整片
+        //     缓存太慢，正确做法是把同一片物理页映射成两个视图（RW 视图写、RX 视图执行，
+        //     即 V8 那种双映射设计，可用 mach_vm_remap 实现）。
+        for (prot, flags) in [(rw, anon), (rwx, anon), (rwx, jit)] {
             let p = libc::mmap(std::ptr::null_mut(), size, prot, flags, -1, 0);
             if p != libc::MAP_FAILED {
                 if let Some(n) = NonNull::new(p.cast::<u8>()) {
@@ -353,6 +358,25 @@ if os.path.exists(_vc_cargo):
         changed += 1
     else:
         log("SKIP", "src/video_core/Cargo.toml", "objc2-ui-kit 已存在")
+
+# ---------------------------------------------------------------------------
+# 3b. video_core：把 retained_len 的诊断 cfg 也放开到 iOS
+# ---------------------------------------------------------------------------
+# `delayed_destruction_ring.rs` 里 retained_len() 的 cfg 是
+#   #[cfg(any(test, target_os = "macos"))]
+# 而 renderer_metal/metal_texture_cache.rs 在**非测试代码**里调用了它 3 次。
+# 以前 renderer_metal 只在 macOS 编译所以没事；我们把 Metal 后端放开到 iOS 之后，
+# 这 3 个调用就在 iOS 上被编译 → 3 个 E0599。把 cfg 补上 ios 即可。
+edit(
+    "src/video_core/src/delayed_destruction_ring.rs",
+    [
+        (
+            '#[cfg(any(test, target_os = "macos"))]\n    pub(crate) fn retained_len',
+            '#[cfg(any(test, target_os = "macos", target_os = "ios"))]\n    pub(crate) fn retained_len',
+            "retained_len 的诊断 cfg 纳入 iOS",
+        ),
+    ],
+)
 
 # ---------------------------------------------------------------------------
 # 4. common/host_memory.rs：客户机内存管理支持 iOS

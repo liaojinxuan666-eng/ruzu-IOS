@@ -78,11 +78,12 @@ unsafe fn mmap_reserve(len: usize) -> Result<*mut u8, i32> {
     }
 }
 
-/// 开一段可执行页。
+/// 开一段**可写**页（RW，不含 X）。
 ///
-/// iOS 不支持 MAP_JIT（真机实测 EINVAL/EACCES），所以这里用**普通匿名 RWX 映射**，
-/// 再用 `ruzu_page_protection` 读回内核的**真实**权限 —— 只有真的带 X 才执行，
-/// 避免把探测变成闪退。
+/// 为什么要这样：真机实测（iPhone11,6 / iOS 18.5）——**一次性请求 RWX 会被内核
+/// 剥掉 X 位**（W^X 策略），执行时 SIGBUS；正确姿势是
+/// 「映射 RW → 写入 → mprotect(RX) → 执行」，这条实测能跑通。
+/// 写入与权限翻转由 `write_code_at`（即 `jitmem::write_code`）负责。
 unsafe fn mmap_jit(addr: *mut u8, len: usize, fixed: bool) -> Result<*mut u8, i32> {
     let mut flags = libc::MAP_PRIVATE | libc::MAP_ANON;
     if fixed {
@@ -91,7 +92,7 @@ unsafe fn mmap_jit(addr: *mut u8, len: usize, fixed: bool) -> Result<*mut u8, i3
     let p = libc::mmap(
         addr as *mut c_void,
         len,
-        libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+        libc::PROT_READ | libc::PROT_WRITE,
         flags,
         -1,
         0,
@@ -134,37 +135,38 @@ fn probe_executable_guest_va(out: &mut String) {
                 match mmap_jit(target, PAGE, true) {
                     Ok(p) => {
                         writeln!(out, "[OK]   ①-b 在预留区内 MAP_FIXED 叠加 RWX 页 @ {p:p}").unwrap();
-                        if !page_executable(p, PAGE) {
-                            writeln!(
-                                out,
-                                "[FAIL] ①-c 内核把 X 位剥掉了（本进程没有 JIT 权限）→ 不执行，免得闪退\n\
-                                 　　　→ 先把 JIT 开了再来测 NCE（见①诊断的结论）"
-                            )
-                            .unwrap();
-                            libc::munmap(p as *mut c_void, PAGE);
-                            libc::munmap(base as *mut c_void, RESERVE);
-                            return;
-                        }
-
-                        // 顺手真执行一条，确认不是"能映射但跑不了"
+                        // 先写入（内部会把页 mprotect 成 RX），再检查是否真的可执行，最后才执行
+                        crate::log_line("NCE①: 即将写入并执行 MAP_FIXED 页");
                         match write_code_at(p, PAGE, &encode_return_imm(7)) {
                             Ok(()) => {
-                                let f: extern "C" fn() -> u32 = std::mem::transmute(p);
-                                let v = f();
-                                if v == 7 {
-                                    writeln!(out, "[OK]   ①-c 该页里的代码真的执行了（返回 {v}）").unwrap();
+                                if !page_executable(p, PAGE) {
+                                    writeln!(
+                                        out,
+                                        "[FAIL] ①-c 写完后该页仍无 X（内核不给可执行）→ 不执行，免得闪退"
+                                    )
+                                    .unwrap();
                                 } else {
-                                    writeln!(out, "[??]   ①-c 执行了但返回 {v}（期望 7）").unwrap();
+                                    let f: extern "C" fn() -> u32 = std::mem::transmute(p);
+                                    let v = f();
+                                    if v == 7 {
+                                        writeln!(out, "[OK]   ①-c 该页里的代码真的执行了（返回 {v}）").unwrap();
+                                    } else {
+                                        writeln!(out, "[??]   ①-c 执行了但返回 {v}（期望 7）").unwrap();
+                                    }
                                 }
                             }
                             Err(e) => writeln!(
                                 out,
                                 "[FAIL] ①-c 能映射但写不进去：{e}\n\
-                                 　　→ MAP_JIT 页在当前环境下只读，NCE 无法就地打补丁"
+                                 　　→ 该页不可写，NCE 无法就地打补丁"
                             )
                             .unwrap(),
                         }
-                        libc::munmap(p as *mut c_void, PAGE);
+                        // **不要**在这里单独 munmap(p)：接着再 munmap 整片预留区会形成
+                        // "跨越空洞的解除映射"，iOS 会判定为 EXC_GUARD / DEALLOC_GAP
+                        // 并直接 SIGKILL（2026-10-17 真机崩过）。整片一次性释放即可。
+                        libc::munmap(base as *mut c_void, RESERVE);
+                        return;
                     }
                     Err(e) => writeln!(
                         out,
@@ -189,16 +191,17 @@ fn probe_self_modifying(out: &mut String) {
                 return;
             }
             Ok(p) => {
-                if !page_executable(p, 64 * 1024) {
-                    writeln!(out, "[FAIL] ② 页面没有 X 权限（没有 JIT），跳过").unwrap();
-                    libc::munmap(p as *mut c_void, 64 * 1024);
-                    return;
-                }
                 if let Err(e) = write_code_at(p, 64 * 1024, &CODE_RET_1) {
-                    writeln!(out, "[FAIL] ② JIT 页无法写入：{e}").unwrap();
+                    writeln!(out, "[FAIL] ② 页面无法写入：{e}").unwrap();
                     libc::munmap(p as *mut c_void, 64 * 1024);
                     return;
                 }
+                if !page_executable(p, 64 * 1024) {
+                    writeln!(out, "[FAIL] ② 写完仍未拿到 X 权限（内核不给可执行）→ 跳过执行").unwrap();
+                    libc::munmap(p as *mut c_void, 64 * 1024);
+                    return;
+                }
+                crate::log_line("NCE②: 即将执行第一版代码");
                 let f: extern "C" fn() -> u32 = std::mem::transmute(p);
                 let first = f();
 
@@ -232,16 +235,17 @@ fn probe_exclusive_monitor(out: &mut String) {
         };
 
         // 代码页 + 数据（放在同一页的后半部分，避开代码）
-        if !page_executable(page, 64 * 1024) {
-            writeln!(out, "[FAIL] ③ 页面没有 X 权限（没有 JIT），跳过").unwrap();
-            libc::munmap(page as *mut c_void, 64 * 1024);
-            return;
-        }
         if let Err(e) = write_code_at(page, 64 * 1024, &CODE_RMW) {
-            writeln!(out, "[FAIL] ③ JIT 页无法写入：{e}").unwrap();
+            writeln!(out, "[FAIL] ③ 页面无法写入：{e}").unwrap();
             libc::munmap(page as *mut c_void, 64 * 1024);
             return;
         }
+        if !page_executable(page, 64 * 1024) {
+            writeln!(out, "[FAIL] ③ 写完仍未拿到 X 权限（内核不给可执行）→ 跳过执行").unwrap();
+            libc::munmap(page as *mut c_void, 64 * 1024);
+            return;
+        }
+        crate::log_line("NCE③: 即将多线程执行独占监视器测试");
         let rmw: extern "C" fn(*mut u32) -> u32 = std::mem::transmute(page);
         let counter = page.add(32 * 1024) as *mut u32;
         *counter = 0;
@@ -425,15 +429,22 @@ fn probe_signal_recovery(out: &mut String) {
 
 pub fn precheck() -> String {
     let mut out = String::new();
+    crate::log_line("");
+    crate::log_line("========== NCE 预检开始 ==========");
     writeln!(out, "NCE（原生执行）可行性预检 —— 四个前提逐条实测\n").unwrap();
     writeln!(out, "① 客户机 VA 里开可执行映射").unwrap();
+    crate::log_line("precheck: 进入 ①");
     probe_executable_guest_va(&mut out);
     writeln!(out, "\n② 自修改代码（改完立刻重执行）").unwrap();
+    crate::log_line("precheck: 进入 ②");
     probe_self_modifying(&mut out);
     writeln!(out, "\n③ 独占监视器 LDXR/STXR（含多线程竞争）").unwrap();
+    crate::log_line("precheck: 进入 ③");
     probe_exclusive_monitor(&mut out);
     writeln!(out, "\n④ 信号处理器拦截与恢复").unwrap();
+    crate::log_line("precheck: 进入 ④");
     probe_signal_recovery(&mut out);
+    crate::log_line("precheck: 全部完成");
 
     let ok = out.matches("[OK]").count();
     let fail = out.matches("[FAIL]").count();

@@ -28,6 +28,13 @@ char *ruzu_ios_nce_precheck(void);
 /// 尽力而为：iOS 26+ 内核已封这条路。成功后请重跑一次诊断。
 char *ruzu_ios_try_self_trace(void);
 
+/// 设置探测日志文件路径（Swift 在启动时传入 Documents 目录下的文件）。
+/// 危险探测执行前会先写日志，闪退后可据此定位崩在哪一步。
+void ruzu_ios_set_log_path(const char *path);
+
+/// 读出探测日志内容。
+char *ruzu_ios_read_log(void);
+
 /// 释放上面几个函数返回的字符串。
 void ruzu_ios_free_string(char *s);
 

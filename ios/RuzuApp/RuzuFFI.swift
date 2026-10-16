@@ -28,4 +28,14 @@ enum RuzuFFI {
 
     /// 尝试自持 JIT（ptrace hack）。不会闪退。
     static var trySelfTrace: String { take(ruzu_ios_try_self_trace()) }
+
+    /// 读出探测日志（危险探测执行前会写，闪退后靠它定位）。
+    static var log: String { take(ruzu_ios_read_log()) }
+
+    /// 在 App 启动时告诉 Rust 日志写到哪里（Documents/nce_probe.log）。
+    static func configureLogPath() {
+        let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let path = dir.appendingPathComponent("nce_probe.log").path
+        path.withCString { ruzu_ios_set_log_path($0) }
+    }
 }
