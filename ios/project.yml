@@ -1,0 +1,68 @@
+# XcodeGen 工程描述 —— CI 上 `xcodegen generate` 生成 Ruzu.xcodeproj。
+#
+# 为什么用 XcodeGen 而不是手写 .xcodeproj：
+#   1. xcodeproj 是巨型 XML，手写/审查都容易出错；
+#   2. 我们全程在 CI 里生成工程，仓库里不存二进制式工程文件，diff 干净；
+#   3. 加目标（后续的 Swift 游戏库 UI、Metal 渲染视图、键盘扩展）只要改这个 YAML。
+
+name: Ruzu
+
+options:
+  bundleIdPrefix: org.ruzu
+  createIntermediateGroups: true
+  deploymentTarget:
+    iOS: "15.0"          # 想支持更老的越狱设备就往下调；MAP_JIT 需要 iOS 14+
+  groupSortPosition: top
+
+# 设置集中在 target 上，避免继承歧义
+targets:
+  Ruzu:
+    type: application
+    platform: iOS
+    sources:
+      - path: RuzuApp
+        excludes:
+          - "Info.plist"
+          - "RuzuApp.entitlements"
+    settings:
+      base:
+        PRODUCT_NAME: Ruzu
+        PRODUCT_BUNDLE_IDENTIFIER: org.ruzu.ruzu
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        INFOPLIST_FILE: RuzuApp/Info.plist
+        SWIFT_OBJC_BRIDGING_HEADER: RuzuApp/RuzuApp-Bridging-Header.h
+        CODE_SIGN_ENTITLEMENTS: RuzuApp/RuzuApp.entitlements
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ARCHS: arm64
+        ONLY_ACTIVE_ARCH: NO
+        ENABLE_BITCODE: NO
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        SWIFT_OPTIMIZATION_LEVEL: "-O"
+        HEADER_SEARCH_PATHS:
+          - "$(SRCROOT)/RuzuApp"
+        # Rust 交叉编译产物：仓库根目录的 target/aarch64-apple-ios/release
+        LIBRARY_SEARCH_PATHS:
+          - "$(SRCROOT)/../target/aarch64-apple-ios/release"
+        # 静态库要在最后 link；-lc++ 是给以后的 C++ 依赖（cubeb / spirv-cross）预留的
+        OTHER_LDFLAGS:
+          - "-lruzu_ios"
+          - "-lc++"
+        # 关掉一堆对静态库+无签名构建多余的东西
+        DEAD_CODE_STRIPPING: YES
+        STRIP_INSTALLED_PRODUCT: NO
+      configs:
+        Debug:
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: DEBUG
+          GCC_PREPROCESSOR_DEFINITIONS: "DEBUG=1 $(inherited)"
+
+schemes:
+  Ruzu:
+    build:
+      targets:
+        Ruzu: all
+    run:
+      config: Debug
+    archive:
+      config: Release

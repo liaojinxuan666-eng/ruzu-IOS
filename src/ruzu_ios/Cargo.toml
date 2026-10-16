@@ -1,0 +1,19 @@
+[package]
+name = "ruzu_ios"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "ruzu 的 iOS 宿主门面（C ABI），供 Swift/UIKit 外壳调用"
+
+# 故意不写 version.workspace = true：这个 crate 即使被移出 workspace 也能独立编译
+# （CI 里补丁脚本会把它加进 workspace members，但脚本失败时不应连带炸掉构建）。
+
+[lib]
+name = "ruzu_ios"
+crate-type = ["staticlib"]
+
+[dependencies]
+libc = "0.2"
+
+[profile.dev]
+opt-level = 1
