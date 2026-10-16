@@ -51,7 +51,12 @@ final class ViewController: UIViewController {
         unsigned.setTitleColor(.systemRed, for: .normal)
         unsigned.addTarget(self, action: #selector(runUnsignedProbe), for: .touchUpInside)
 
-        let buttons = UIStackView(arrangedSubviews: [safe, metal, unsigned])
+        let nce = UIButton(type: .system)
+        nce.setTitle("④ NCE 预检（可能闪退）", for: .normal)
+        nce.setTitleColor(.systemRed, for: .normal)
+        nce.addTarget(self, action: #selector(runNCEPrecheck), for: .touchUpInside)
+
+        let buttons = UIStackView(arrangedSubviews: [safe, metal, unsigned, nce])
         buttons.axis = .vertical
         buttons.spacing = 8
 
@@ -119,6 +124,34 @@ final class ViewController: UIViewController {
         previewView.isHidden = false
         view.layoutIfNeeded()
         append(MetalProbe.run(layer: previewView.metalLayer))
+    }
+
+    @objc private func runNCEPrecheck() {
+        let alert = UIAlertController(
+            title: "NCE 可行性预检",
+            message: """
+            会有四组实验，其中两组比较激进：
+            · 在预留的客户机 VA 里 MAP_FIXED 叠加可执行页
+            · 自修改代码后立刻重执行
+            · 4 线程独占监视器（LDXR/STXR）压力测试
+            · 注册 SIGSEGV 处理器并从信号中恢复
+
+            没有 JIT 权限时可能闪退 —— 闪退本身就是结论，重开 App 即可。
+            """,
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: "取消", style: .cancel))
+        alert.addAction(UIAlertAction(title: "开始", style: .default) { [weak self] _ in
+            guard let self else { return }
+            self.reset("NCE 预检")
+            self.append("运行中（多线程独占监视器测试可能要几秒）…")
+            // 信号处理器的 setjmp/longjmp 必须与调用同线程，所以整段放在同一个队列里跑
+            DispatchQueue.global(qos: .userInitiated).async {
+                let report = RuzuFFI.ncePrecheck
+                DispatchQueue.main.async { self.append(report) }
+            }
+        })
+        present(alert, animated: true)
     }
 
     override func viewDidLayoutSubviews() {
