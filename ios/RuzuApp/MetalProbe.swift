@@ -27,8 +27,8 @@ enum MetalProbe {
         layer.presentsWithTransaction = false
 
         out += "[OK]  Metal 设备：\(device.name)\n"
-        out += "      低功耗（集显）标记：\(device.isLowPower)\n"
-        out += "      可拆卸（外置）标记：\(device.isRemovable)\n"
+        out += "      registryID：\(device.registryID)\n"
+        out += "      最大线程组尺寸：\(device.maxThreadsPerThreadgroup.width)×\(device.maxThreadsPerThreadgroup.height)×\(device.maxThreadsPerThreadgroup.depth)\n"
 
         guard let queue = device.makeCommandQueue() else {
             return out + "[FAIL] 创建 MTLCommandQueue 失败"
