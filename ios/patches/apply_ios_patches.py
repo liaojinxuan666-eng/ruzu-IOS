@@ -41,6 +41,37 @@ def _write(path, text):
         f.write(text.encode("utf-8"))
 
 
+def replace_all(relpath, old, new, note):
+    """无条件全量替换。
+
+    与 edit() 的区别：**不做"目标是否已存在"的守卫**，只看源模式还在不在。
+    适合 `X` → `Y` 这种源模式替换后就彻底消失的场景（比如把某个 cfg 放宽），
+    因为不会出现"部分替换后守卫误判、跳过剩余位置"的问题。
+    """
+    global changed
+    path = os.path.join(ROOT, relpath)
+    if not os.path.exists(path):
+        log("MISSING", relpath)
+        problems.append(f"{relpath} 不存在")
+        return
+    text = _read(path)
+    crlf = "\r\n" in text
+    count = text.count(old)
+    if count == 0:
+        if new in text:
+            log("SKIP", relpath, f"已是目标状态：{note}")
+        else:
+            log("MISS", relpath, f"未找到模式：{note}")
+            problems.append(f"{relpath}: 未找到 {note}")
+        return
+    text = text.replace(old, new)
+    if crlf:
+        text = text.replace(old.replace("\n", "\r\n"), new.replace("\n", "\r\n"))
+    _write(path, text)
+    log("PATCHED", relpath, f"{note}（{count} 处）")
+    changed += 1
+
+
 def edit(relpath, replacements):
     """对 relpath 依次做精确字符串替换。replacements = [(旧, 新, 说明), ...]
 
@@ -65,7 +96,7 @@ def edit(relpath, replacements):
             variants = [(old.replace("\n", "\r\n"), new.replace("\n", "\r\n")),
                         (old, new)]
 
-        done = any(n in text for _, n in variants)
+        done = bool(new) and any(n and n in text for _, n in variants)
         if done:
             log("SKIP", relpath, f"已是目标状态：{note}")
             continue
@@ -210,6 +241,161 @@ edit(
             '#[cfg(target_os = "macos")]\nfn map_noreserve() -> i32 {\n    0\n}',
             '#[cfg(any(target_os = "macos", target_os = "ios"))]\nfn map_noreserve() -> i32 {\n    0\n}',
             "map_noreserve 覆盖 iOS",
+        ),
+    ],
+)
+
+# 上面那步只覆盖了 map_noreserve。文件里还有几处 macos-only 的定义/分支，
+# 它们是同一套 POSIX 实现的一部分（CString / AtomicU64 导入、create_backing_fd、
+# clear_backing_region 的返回分支），漏掉就会在 iOS 上报：
+#   error[E0425]: cannot find function `create_backing_fd` in this scope
+#   error[E0308]: mismatched types（clear_backing_region 返回 ()，期望 bool）
+# 这里把 host_memory.rs 里剩下的 macos-only cfg 全部放宽到 iOS。
+replace_all(
+    "src/common/src/host_memory.rs",
+    '#[cfg(target_os = "macos")]',
+    '#[cfg(any(target_os = "macos", target_os = "ios"))]',
+    "host_memory 其余 macos-only 分支纳入 iOS",
+)
+
+# ---------------------------------------------------------------------------
+# 6. audio_core：iOS 上摘掉 cubeb
+# ---------------------------------------------------------------------------
+# cubeb 的 CoreAudio 后端在 iOS 上根本构建不了：
+#   cubeb-sys → cubeb-coreaudio-rs → coreaudio-sys 0.2.14
+#   其 build.rs 里写死 `assert!(target.contains("apple-darwin"))`，
+#   目标三元组是 aarch64-apple-ios 时直接 panic（exit 101）。
+# audio_core 本来就有 SDL3 后端（sdl3_sink.rs），SDL3 在 iOS 上走系统 CoreAudio，
+# 所以 iOS 上摘掉 cubeb、把音频引擎默认切到 SDL3 即可。
+#
+# 这段用专门的逻辑而不是通用 edit()，因为「删除一行依赖 + 追加一个 target 块」
+# 用通用守卫容易误判（空替换永远"已生效"、删除模式会误伤新加的块）。
+_ac = os.path.join(ROOT, "src/audio_core/Cargo.toml")
+if not os.path.exists(_ac):
+    log("MISSING", "src/audio_core/Cargo.toml")
+    problems.append("src/audio_core/Cargo.toml 不存在")
+else:
+    _t = _read(_ac)
+    _nl = "\r\n" if "\r\n" in _t else "\n"
+    _orig = _t
+    # ① 删掉 [dependencies] 里那行无条件 cubeb（靠"后面紧跟 log"定位，不会误伤新块）
+    _t = _t.replace(
+        "cubeb.workspace = true" + _nl + "log.workspace = true",
+        "log.workspace = true",
+    )
+    # ② 追加「非 iOS 才有 cubeb」的依赖块
+    if "[target.'cfg(not(target_os = \"ios\"))'.dependencies]" not in _t:
+        _t = _t.rstrip() + _nl + _nl.join(
+            [
+                "",
+                "# cubeb 的 CoreAudio 后端不支持 iOS（coreaudio-sys 的 build.rs 写死 apple-darwin），",
+                "# iOS 上改用 SDL3 的 CoreAudio 输出",
+                "[target.'cfg(not(target_os = \"ios\"))'.dependencies]",
+                "cubeb.workspace = true",
+                "",
+            ]
+        )
+    if _t != _orig:
+        _write(_ac, _t)
+        log("PATCHED", "src/audio_core/Cargo.toml", "cubeb 改为仅非 iOS 依赖")
+        changed += 1
+    else:
+        log("SKIP", "src/audio_core/Cargo.toml", "cubeb 已是仅非 iOS 依赖")
+
+edit(
+    "src/audio_core/src/sink/mod.rs",
+    [
+        (
+            "pub mod cubeb_sink;",
+            '#[cfg(not(target_os = "ios"))]\npub mod cubeb_sink;',
+            "cubeb sink 不在 iOS 上编译",
+        ),
+    ],
+)
+
+edit(
+    "src/audio_core/src/sink/sink_details.rs",
+    [
+        (
+            "use crate::sink::cubeb_sink::{get_cubeb_latency, list_cubeb_sink_devices, CubebSink};",
+            '#[cfg(not(target_os = "ios"))]\n'
+            "use crate::sink::cubeb_sink::{get_cubeb_latency, list_cubeb_sink_devices, CubebSink};",
+            "cubeb 导入仅在非 iOS",
+        ),
+        (
+            "    if sink_id == AudioEngine::Auto {\n"
+            "        let selected = if get_cubeb_latency() > TARGET_SAMPLE_COUNT * 3 {\n"
+            "            AudioEngine::Sdl3\n"
+            "        } else {\n"
+            "            AudioEngine::Cubeb\n"
+            "        };",
+            "    if sink_id == AudioEngine::Auto {\n"
+            "        // iOS 上没有 cubeb，直接用 SDL3（它在 iOS 上走系统 CoreAudio）\n"
+            '        #[cfg(target_os = "ios")]\n'
+            "        let selected = AudioEngine::Sdl3;\n"
+            '        #[cfg(not(target_os = "ios"))]\n'
+            "        let selected = if get_cubeb_latency() > TARGET_SAMPLE_COUNT * 3 {\n"
+            "            AudioEngine::Sdl3\n"
+            "        } else {\n"
+            "            AudioEngine::Cubeb\n"
+            "        };",
+            "Auto 在 iOS 上选 SDL3",
+        ),
+        (
+            "    match sink_id {\n"
+            "        AudioEngine::Cubeb | AudioEngine::Sdl3 | AudioEngine::Null => sink_id,",
+            "    // 配置里如果写着 Cubeb，iOS 上降级到 SDL3\n"
+            '    #[cfg(target_os = "ios")]\n'
+            "    if sink_id == AudioEngine::Cubeb {\n"
+            '        info!("audio_core: cubeb 在 iOS 上不可用，改用 SDL3");\n'
+            "        return AudioEngine::Sdl3;\n"
+            "    }\n"
+            "\n"
+            "    match sink_id {\n"
+            "        AudioEngine::Cubeb | AudioEngine::Sdl3 | AudioEngine::Null => sink_id,",
+            "显式 Cubeb 配置降级",
+        ),
+        (
+            "pub fn get_sink_ids() -> Vec<AudioEngine> {\n"
+            "    vec![AudioEngine::Cubeb, AudioEngine::Sdl3, AudioEngine::Null]\n"
+            "}",
+            "pub fn get_sink_ids() -> Vec<AudioEngine> {\n"
+            '    #[cfg(target_os = "ios")]\n'
+            "    {\n"
+            "        return vec![AudioEngine::Sdl3, AudioEngine::Null];\n"
+            "    }\n"
+            '    #[cfg(not(target_os = "ios"))]\n'
+            "    vec![AudioEngine::Cubeb, AudioEngine::Sdl3, AudioEngine::Null]\n"
+            "}",
+            "iOS 不暴露 Cubeb 引擎",
+        ),
+        (
+            "        AudioEngine::Cubeb => list_cubeb_sink_devices(capture),",
+            "        AudioEngine::Cubeb => {\n"
+            '            #[cfg(not(target_os = "ios"))]\n'
+            "            {\n"
+            "                list_cubeb_sink_devices(capture)\n"
+            "            }\n"
+            '            #[cfg(target_os = "ios")]\n'
+            "            {\n"
+            "                list_sdl_sink_devices(capture)\n"
+            "            }\n"
+            "        }",
+            "设备枚举在 iOS 上走 SDL3",
+        ),
+        (
+            "        AudioEngine::Cubeb => Box::new(CubebSink::new(device_id)) as Box<dyn Sink>,",
+            "        AudioEngine::Cubeb => {\n"
+            '            #[cfg(not(target_os = "ios"))]\n'
+            "            {\n"
+            "                Box::new(CubebSink::new(device_id)) as Box<dyn Sink>\n"
+            "            }\n"
+            '            #[cfg(target_os = "ios")]\n'
+            "            {\n"
+            "                Box::new(SDLSink::new(device_id)) as Box<dyn Sink>\n"
+            "            }\n"
+            "        }",
+            "sink 创建在 iOS 上走 SDL3",
         ),
     ],
 )
