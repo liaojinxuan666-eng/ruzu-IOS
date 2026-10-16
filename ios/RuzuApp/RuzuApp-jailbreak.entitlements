@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  越狱 / 自签名专用 entitlements —— **不越狱时不要用这个**。
+
+	  用法示例（设备上或 Mac 上）：
+	      ldid -SRuzuApp-jailbreak.entitlements Ruzu.app/Ruzu
+	  或 TrollStore 安装时指定这份 plist。
+
+	  这些键普通开发者证书签不出来（provisioning profile 里没有），只有越狱环境
+	  或做了特殊处理的签名流程才能生效。它们分别解决：
+
+	    get-task-allow                 允许调试器 attach（顺带放开 JIT）
+	    dynamic-codesigning            越狱/自签名下 MAP_JIT 的通行证
+	    com.apple.security.cs.allow-jit / allow-unsigned-executable-memory
+	                                   可写可执行内存（macOS 风格的键，越狱环境同样认）
+	    com.apple.security.cs.disable-library-validation
+	                                   允许加载非同一证书签名的 dylib
+	    com.apple.developer.kernel.increased-memory-limit
+	                                   iOS 上给模拟器用的内存上限提升键（Apple 特批）
+	    com.apple.developer.kernel.extended-virtual-addressing
+	                                   扩展虚拟地址空间 —— 客户机要预留数 GiB VA 就靠它
+	                                   （参考 UTM 的 Platform/iOS/iOS.entitlements）
+
+	  注意最后两个键即使越狱也不一定生效，取决于内核是否放行；App 里「运行诊断」
+	  会实测 jetsam 上限和实际能预留多少 VA，看数字说话。
+	-->
+	<key>get-task-allow</key>
+	<true/>
+	<key>dynamic-codesigning</key>
+	<true/>
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+	<true/>
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+	<key>com.apple.developer.kernel.increased-memory-limit</key>
+	<true/>
+	<key>com.apple.developer.kernel.extended-virtual-addressing</key>
+	<true/>
+</dict>
+</plist>

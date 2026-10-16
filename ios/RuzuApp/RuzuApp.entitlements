@@ -2,17 +2,25 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<!--
+	  默认 entitlements —— 给「不越狱」路线用。
+
+	  这里**故意只放 get-task-allow**，原因：
+	  侧载工具（SideStore / AltStore）会用你自己的开发者证书重签，而重签能用的
+	  entitlements 必须是你的 provisioning profile 里已经授权的那一份。多写一个
+	  没被授权的键，安装会直接失败。
+
+	  get-task-allow 是开发型 profile 自带的，所以这条一定能过。
+
+	  它有什么用：允许调试器 attach 本进程。attach 之后系统把进程标记成
+	  CS_DEBUGGED，JIT（mmap MAP_JIT / 可执行内存）就放开了 —— 这正是
+	  StikDebug 那类「给 App 开 JIT」工具的工作方式。
+
+	  如果诊断①在挂上调试器后依旧失败（errno=1 EPERM），再试把
+	  RuzuApp-jailbreak.entitlements 里的 dynamic-codesigning 加进来
+	  （能不能签过取决于你的证书类型）。
+	-->
 	<key>get-task-allow</key>
-	<true/>
-	<key>dynamic-codesigning</key>
-	<true/>
-	<key>com.apple.security.cs.allow-jit</key>
-	<true/>
-	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
-	<true/>
-	<key>com.apple.security.cs.disable-library-validation</key>
-	<true/>
-	<key>com.apple.developer.kernel.increased-memory-limit</key>
 	<true/>
 </dict>
 </plist>

@@ -24,6 +24,7 @@ targets:
         excludes:
           - "Info.plist"
           - "RuzuApp.entitlements"
+          - "RuzuApp-jailbreak.entitlements"
     settings:
       base:
         PRODUCT_NAME: Ruzu
