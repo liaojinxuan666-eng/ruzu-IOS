@@ -227,19 +227,20 @@ _RH_MMAP_OLD = '''unsafe fn mmap_code_cache(size: usize) -> Result<NonNull<u8>, 
 }'''
 
 _RH_MMAP_NEW = '''unsafe fn mmap_code_cache(size: usize) -> Result<NonNull<u8>, String> {
-    // iOS：分两步试。
-    //   ① WebKit 的官方 JIT 姿势：RW + MAP_JIT（**不要**在这里就请求 PROT_EXEC）。
-    //      真机实测 RWX + MAP_JIT 在 iOS 上直接 errno=22 (EINVAL)；
-    //      可执行性靠"关写保护 → 写入 → 开写保护"翻转拿到。
-    //   ② 退回 macOS 上的老写法：RWX + MAP_JIT。
+    // iOS：按顺序试三种映射，第一个成功即用。
+    //   ① 普通 RWX 匿名映射（**iOS 的正确姿势**）—— 可执行性由代码签名授权
+    //      （dynamic-codesigning entitlement / CS_DEBUGGED）保证。
+    //      真机实测（iPhone11,6 / iOS 18.5）：这条 OK。
+    //   ②③ MAP_JIT 两个变体只作兜底 —— MAP_JIT 是 macOS 专有机制，
+    //      iOS 上实测 RWX+MAP_JIT 报 EINVAL、RW+MAP_JIT 报 EACCES。
     #[cfg(target_os = "ios")]
     {
-        let jit = libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT;
-        for prot in [
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-        ] {
-            let p = libc::mmap(std::ptr::null_mut(), size, prot, jit, -1, 0);
+        let anon = libc::MAP_PRIVATE | libc::MAP_ANON;
+        let jit = anon | libc::MAP_JIT;
+        let rwx = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
+        let rw = libc::PROT_READ | libc::PROT_WRITE;
+        for (prot, flags) in [(rwx, anon), (rwx, jit), (rw, jit)] {
+            let p = libc::mmap(std::ptr::null_mut(), size, prot, flags, -1, 0);
             if p != libc::MAP_FAILED {
                 if let Some(n) = NonNull::new(p.cast::<u8>()) {
                     return Ok(n);
@@ -247,7 +248,7 @@ _RH_MMAP_NEW = '''unsafe fn mmap_code_cache(size: usize) -> Result<NonNull<u8>, 
             }
         }
         return Err(format!(
-            "failed to allocate ARM64 executable code cache (iOS, MAP_JIT): {}",
+            "failed to allocate ARM64 executable code cache (iOS): {}",
             std::io::Error::last_os_error()
         ));
     }
