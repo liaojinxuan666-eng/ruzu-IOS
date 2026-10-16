@@ -20,6 +20,7 @@
 use std::ffi::{c_char, c_int, c_void, CString};
 use std::fmt::Write as _;
 
+mod jitmem;
 mod nce_probe;
 
 /// Darwin 的 `MAP_JIT`。不直接用 libc 常量，避免不同 libc 版本差异。
@@ -33,11 +34,6 @@ const PROBE_CODE: [u32; 2] = [0x5280_0000 | (42u32 << 5), 0xD65F_03C0];
 const PROBE_EXPECT: u32 = 42;
 
 extern "C" {
-    /// iOS 14+ / macOS 11+。开写保护 = JIT 页可执行不可写；关 = 可写不可执行。
-    /// 这是 Apple Silicon 上 W^X 的官方逃逸口。
-    fn pthread_jit_write_protect_np(enabled: c_int);
-    /// 写完机器码必须刷 I-cache，否则 CPU 执行的还是旧内容。
-    fn sys_icache_invalidate(start: *mut c_void, len: usize);
     fn sysctlbyname(
         name: *const c_char,
         oldp: *mut c_void,
@@ -124,16 +120,9 @@ unsafe fn mmap_region(len: usize, prot: c_int, map_jit: bool) -> Result<*mut c_v
     }
 }
 
-/// 写入探针机器码。`toggle_write_protect` 为真时先关写保护、写完再打开。
-unsafe fn write_code(p: *mut c_void, toggle_write_protect: bool) {
-    if toggle_write_protect {
-        pthread_jit_write_protect_np(0);
-    }
-    std::ptr::copy_nonoverlapping(PROBE_CODE.as_ptr() as *const u8, p as *mut u8, 8);
-    if toggle_write_protect {
-        pthread_jit_write_protect_np(1);
-    }
-    sys_icache_invalidate(p, 8);
+/// 写入探针机器码。写保护切换（或 mprotect 降级）都在 `jitmem` 里统一处理。
+unsafe fn write_code(p: *mut c_void, len: usize) -> Result<(), String> {
+    jitmem::write_code(p, len, &PROBE_CODE)
 }
 
 /// 执行已写入的探针机器码。**这是唯一可能因无权限而触发 EXC_BAD_ACCESS 的地方。**
@@ -158,12 +147,16 @@ fn probe_official() -> String {
     unsafe {
         match mmap_region(len, rwx, true) {
             Ok(p) => {
-                write_code(p, true);
-                let r = call_code(p);
-                if r == PROBE_EXPECT {
-                    writeln!(out, "[OK]  MAP_JIT + 写保护：{}", describe(Ok(r))).unwrap();
-                } else {
-                    writeln!(out, "[??]  MAP_JIT + 写保护：{}", describe(Ok(r))).unwrap();
+                match write_code(p, len) {
+                    Ok(()) => {
+                        let r = call_code(p);
+                        if r == PROBE_EXPECT {
+                            writeln!(out, "[OK]  MAP_JIT + 写保护：{}", describe(Ok(r))).unwrap();
+                        } else {
+                            writeln!(out, "[??]  MAP_JIT + 写保护：{}", describe(Ok(r))).unwrap();
+                        }
+                    }
+                    Err(e) => writeln!(out, "[FAIL] MAP_JIT 页写入失败：{e}").unwrap(),
                 }
                 libc::munmap(p, len);
             }
@@ -185,10 +178,10 @@ fn probe_unsigned() -> String {
     let rw = libc::PROT_READ | libc::PROT_WRITE;
     let rwx = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
     unsafe {
-        // 路径 B：裸 RWX，无 MAP_JIT、无写保护
+        // 路径 B：裸 RWX，无 MAP_JIT、无写保护（这条就是"直接硬写"，越狱环境才有）
         match mmap_region(len, rwx, false) {
             Ok(p) => {
-                write_code(p, false);
+                jitmem::write_code_raw(p, &PROBE_CODE);
                 let r = call_code(p);
                 writeln!(out, "[{}] 裸 RWX（无 MAP_JIT）：{}", if r == PROBE_EXPECT { "OK" } else { "??" }, describe(Ok(r))).unwrap();
                 libc::munmap(p, len);
@@ -199,7 +192,7 @@ fn probe_unsigned() -> String {
         // 路径 C：RW 写入 → mprotect(RX) → 执行
         match mmap_region(len, rw, false) {
             Ok(p) => {
-                write_code(p, false);
+                jitmem::write_code_raw(p, &PROBE_CODE);
                 if libc::mprotect(p, len, libc::PROT_READ | libc::PROT_EXEC) == 0 {
                     let r = call_code(p);
                     writeln!(out, "[{}] RW → mprotect(RX) → 执行：{}", if r == PROBE_EXPECT { "OK" } else { "??" }, describe(Ok(r))).unwrap();
@@ -271,6 +264,7 @@ pub extern "C" fn ruzu_ios_diagnostics() -> *mut c_char {
     writeln!(s, "=== 运行环境 ===").unwrap();
     s.push_str(&environment_report());
     writeln!(s, "\n=== JIT（官方路径）===").unwrap();
+    writeln!(s, "{}", jitmem::status_line()).unwrap();
     let jit = probe_official();
     s.push_str(&jit);
     writeln!(s, "\n=== 客户机内存预留（PROT_NONE + MAP_NORESERVE）===").unwrap();

@@ -24,10 +24,8 @@ use std::fmt::Write as _;
 
 const MAP_JIT: c_int = 0x0800;
 
-extern "C" {
-    fn pthread_jit_write_protect_np(enabled: c_int);
-    fn sys_icache_invalidate(start: *mut c_void, len: usize);
-}
+// 注：`pthread_jit_write_protect_np` 在 iOS SDK 里没有符号，绝不能静态引用
+// （会让链接期报 Undefined symbols）。写入逻辑统一走 crate::jitmem。
 
 // ------------------------------------------------------------------ 指令编码
 //
@@ -105,12 +103,9 @@ unsafe fn mmap_jit(addr: *mut u8, len: usize, fixed: bool) -> Result<*mut u8, i3
     }
 }
 
-/// 往 JIT 内存写机器码（临时关写保护 → 写 → 开写保护 → 刷 I-cache）。
-unsafe fn write_code_at(p: *mut u8, words: &[u32]) {
-    pthread_jit_write_protect_np(0);
-    std::ptr::copy_nonoverlapping(words.as_ptr() as *const u8, p, words.len() * 4);
-    pthread_jit_write_protect_np(1);
-    sys_icache_invalidate(p as *mut c_void, words.len() * 4);
+/// 往 JIT 内存写机器码。写保护切换（或 mprotect 降级）由 `crate::jitmem` 统一处理。
+unsafe fn write_code_at(p: *mut u8, len: usize, words: &[u32]) -> Result<(), String> {
+    crate::jitmem::write_code(p as *mut c_void, len, words)
 }
 
 // ------------------------------------------------------------------ ① 可执行映射
@@ -135,13 +130,22 @@ fn probe_executable_guest_va(out: &mut String) {
                         writeln!(out, "[OK]   ①-b 在预留区内 MAP_FIXED 叠加 MAP_JIT RWX 页 @ {p:p}").unwrap();
 
                         // 顺手真执行一条，确认不是"能映射但跑不了"
-                        write_code_at(p, &encode_return_imm(7));
-                        let f: extern "C" fn() -> u32 = std::mem::transmute(p);
-                        let v = f();
-                        if v == 7 {
-                            writeln!(out, "[OK]   ①-c 该页里的代码真的执行了（返回 {v}）").unwrap();
-                        } else {
-                            writeln!(out, "[??]   ①-c 执行了但返回 {v}（期望 7）").unwrap();
+                        match write_code_at(p, PAGE, &encode_return_imm(7)) {
+                            Ok(()) => {
+                                let f: extern "C" fn() -> u32 = std::mem::transmute(p);
+                                let v = f();
+                                if v == 7 {
+                                    writeln!(out, "[OK]   ①-c 该页里的代码真的执行了（返回 {v}）").unwrap();
+                                } else {
+                                    writeln!(out, "[??]   ①-c 执行了但返回 {v}（期望 7）").unwrap();
+                                }
+                            }
+                            Err(e) => writeln!(
+                                out,
+                                "[FAIL] ①-c 能映射但写不进去：{e}\n\
+                                 　　→ MAP_JIT 页在当前环境下只读，NCE 无法就地打补丁"
+                            )
+                            .unwrap(),
                         }
                         libc::munmap(p as *mut c_void, PAGE);
                     }
@@ -168,16 +172,22 @@ fn probe_self_modifying(out: &mut String) {
                 return;
             }
             Ok(p) => {
-                write_code_at(p, &CODE_RET_1);
+                if let Err(e) = write_code_at(p, 64 * 1024, &CODE_RET_1) {
+                    writeln!(out, "[FAIL] ② JIT 页无法写入：{e}").unwrap();
+                    libc::munmap(p as *mut c_void, 64 * 1024);
+                    return;
+                }
                 let f: extern "C" fn() -> u32 = std::mem::transmute(p);
                 let first = f();
 
                 // 就地改写成返回 2 的版本，再执行一次
-                write_code_at(p, &CODE_RET_2);
-                let second = f();
+                let rewrite = write_code_at(p, 64 * 1024, &CODE_RET_2);
+                let second = if rewrite.is_ok() { f() } else { 0 };
 
                 if first == 1 && second == 2 {
                     writeln!(out, "[OK]   ② 自修改代码可用（第一次返回 {first}，改写后返回 {second}）").unwrap();
+                } else if let Err(e) = rewrite {
+                    writeln!(out, "[FAIL] ② 无法就改写代码：{e}").unwrap();
                 } else {
                     writeln!(out, "[FAIL] ② 自修改代码异常：第一次 {first}（期望 1），改写后 {second}（期望 2）").unwrap();
                 }
@@ -200,7 +210,11 @@ fn probe_exclusive_monitor(out: &mut String) {
         };
 
         // 代码页 + 数据（放在同一页的后半部分，避开代码）
-        write_code_at(page, &CODE_RMW);
+        if let Err(e) = write_code_at(page, 64 * 1024, &CODE_RMW) {
+            writeln!(out, "[FAIL] ③ JIT 页无法写入：{e}").unwrap();
+            libc::munmap(page as *mut c_void, 64 * 1024);
+            return;
+        }
         let rmw: extern "C" fn(*mut u32) -> u32 = std::mem::transmute(page);
         let counter = page.add(32 * 1024) as *mut u32;
         *counter = 0;

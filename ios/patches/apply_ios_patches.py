@@ -163,6 +163,83 @@ edit(
 )
 
 # ---------------------------------------------------------------------------
+# 2b. rhazel：iOS 上把 pthread_jit_write_protect_np 改成运行时 dlsym 查找
+# ---------------------------------------------------------------------------
+# 上一步把 cfg 放宽到 iOS 之后，iOS 上会**静态引用** pthread_jit_write_protect_np，
+# 而这个符号在 iOS SDK 的 libSystem stub 里不存在 —— 一旦真的链接（把 core /
+# rdynarmic 编进 App），就会报：
+#   Undefined symbols for architecture arm64: "_pthread_jit_write_protect_np"
+# macOS 保持原样（直接调用），iOS 改成 dlsym：找得到就用写保护开关，找不到就
+# 退化成不动写保护（依赖 JIT entitlement 直接写可执行页）。
+_RH_EXT_OLD = '''#[cfg(all(any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+unsafe extern "C" {
+    fn pthread_jit_write_protect_np(enabled: i32);
+    fn sys_icache_invalidate(start: *mut c_void, len: usize);
+}'''
+
+_RH_EXT_NEW = '''#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe extern "C" {
+    fn pthread_jit_write_protect_np(enabled: i32);
+}
+
+#[cfg(all(any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+unsafe extern "C" {
+    fn sys_icache_invalidate(start: *mut c_void, len: usize);
+}
+
+// iOS 的 SDK stub 里没有 pthread_jit_write_protect_np（那是 macOS 的符号），
+// 静态引用会让链接期报 Undefined symbols，所以这里改成运行时 dlsym 查找。
+#[cfg(all(target_os = "ios", target_arch = "aarch64"))]
+unsafe extern "C" {
+    fn dlsym(handle: *mut c_void, symbol: *const i8) -> *mut c_void;
+}
+
+#[cfg(all(target_os = "ios", target_arch = "aarch64"))]
+unsafe fn ios_set_jit_write_protect(enabled: bool) {
+    use std::sync::OnceLock;
+    type JitWriteProtectFn = unsafe extern "C" fn(i32);
+    static FN: OnceLock<Option<JitWriteProtectFn>> = OnceLock::new();
+    let f = *FN.get_or_init(|| {
+        // RTLD_DEFAULT = (void *)-2：在主程序与所有已加载镜像里找符号
+        let p = dlsym(
+            -2isize as *mut c_void,
+            b"pthread_jit_write_protect_np\\0".as_ptr() as *const i8,
+        );
+        if p.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute::<*mut c_void, JitWriteProtectFn>(p))
+        }
+    });
+    if let Some(f) = f {
+        f(enabled as i32);
+    }
+}'''
+
+edit(
+    "externals/rhazel/src/block_of_code.rs",
+    [
+        (_RH_EXT_OLD, _RH_EXT_NEW, "iOS 用 dlsym 拿写保护函数（避免链接期缺符号）"),
+        (
+            '    #[cfg(all(any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]\n'
+            "    pthread_jit_write_protect_np(enabled as i32);\n"
+            "\n"
+            '    #[cfg(not(all(any(target_os = "macos", target_os = "ios"), target_arch = "aarch64")))]\n'
+            "    let _ = enabled;",
+            '    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]\n'
+            "    pthread_jit_write_protect_np(enabled as i32);\n"
+            "\n"
+            '    #[cfg(all(target_os = "ios", target_arch = "aarch64"))]\n'
+            "    ios_set_jit_write_protect(enabled);\n"
+            "\n"
+            '    #[cfg(not(all(any(target_os = "macos", target_os = "ios"), target_arch = "aarch64")))]\n'
+            "    let _ = enabled;",
+            "set_jit_write_protect 在 iOS 上走 dlsym 版本",
+        ),
+    ],
+)
+
+# ---------------------------------------------------------------------------
 # 3. video_core：Metal 后端从 macOS 放开到 iOS
 # ---------------------------------------------------------------------------
 edit(
