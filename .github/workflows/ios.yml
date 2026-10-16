@@ -1,0 +1,154 @@
+name: ios
+
+# ruzu → iOS 构建流水线（**纯手动触发**，不会因为 push 而自动跑）
+#
+#   Actions → 左侧选 ios → Run workflow → 勾选项 → 运行
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_probe:
+        description: "运行交叉编译探针（收集各 crate 的 iOS 编译错误，不阻塞构建）"
+        type: boolean
+        default: true
+      build_ipa:
+        description: "构建 Rust 静态库 + Xcode 工程 + 打包未签名 IPA"
+        type: boolean
+        default: true
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  RUST_BACKTRACE: "1"
+  IOS_TARGET: aarch64-apple-ios
+
+jobs:
+  build:
+    runs-on: macos-14          # Apple Silicon runner，自带 Xcode + iOS SDK
+    timeout-minutes: 150
+    steps:
+
+      - name: 拉取源码（含子模块 rhazel / rxbyak）
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: 网络抗抖动
+        run: |
+          git config --global http.version HTTP/1.1
+          git config --global http.postBuffer 524288000
+          for host in https://static.crates.io/ https://index.crates.io/ https://github.com/; do
+            for i in 1 2 3; do
+              curl -sSf -m 20 -o /dev/null "$host" && break || { echo "retry $host ($i)"; sleep 5; }
+            done
+          done
+
+      - name: 准备 Rust + iOS target
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add "$IOS_TARGET"
+          rustc --version --verbose
+          xcodebuild -version
+
+      - name: 确认子模块到位
+        run: |
+          test -f externals/rhazel/src/block_of_code.rs || { echo "!! rhazel 缺失（AArch64 JIT 必需）"; exit 1; }
+          test -d externals/rxbyak/src || echo "!! rxbyak 缺失（video_core 会编不过）"
+
+      - name: 打 iOS 补丁
+        run: python3 ios/patches/apply_ios_patches.py
+
+      # ── P0：交叉编译探针（不阻塞构建，只为收集错误）────────────────────
+      - name: P0 交叉编译探针
+        if: ${{ inputs.run_probe }}
+        continue-on-error: true
+        run: bash ios/ci/probe.sh probe-logs
+
+      - name: 汇总探针错误
+        if: ${{ always() && inputs.run_probe }}
+        run: |
+          : > probe-logs/top-errors.txt
+          for f in probe-logs/*.log; do
+            [ -f "$f" ] || continue
+            grep -nE '^error(\[|:)|error: could not|failed to run custom build|Could not find directory|no method named|unresolved import' "$f" \
+              | head -8 | sed "s|^|$(basename "$f"): |" >> probe-logs/top-errors.txt || true
+          done
+          {
+            echo "## aarch64-apple-ios 编译探针"
+            echo
+            echo '```'
+            cat probe-logs/summary.txt 2>/dev/null || echo "(没有结果)"
+            echo '```'
+            echo
+            echo "### 各 crate 首要错误"
+            echo '```'
+            head -120 probe-logs/top-errors.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ── 构建 iOS 门面静态库 ───────────────────────────────────────────
+      - name: 构建 libruzu_ios.a
+        if: ${{ inputs.build_ipa }}
+        run: |
+          cargo build --release --target "$IOS_TARGET" -p ruzu_ios
+          ls -la "target/$IOS_TARGET/release/" | head -20
+
+      # ── 生成 Xcode 工程并编译 App ─────────────────────────────────────
+      - name: 安装 XcodeGen
+        if: ${{ inputs.build_ipa }}
+        run: brew install xcodegen
+
+      - name: 生成 Ruzu.xcodeproj
+        if: ${{ inputs.build_ipa }}
+        run: cd ios && xcodegen generate && ls -la
+
+      - name: xcodebuild（未签名）
+        if: ${{ inputs.build_ipa }}
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project ios/Ruzu.xcodeproj \
+            -scheme Ruzu \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build/DerivedData \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            build | tail -60
+
+      - name: 打包未签名 IPA
+        if: ${{ inputs.build_ipa }}
+        run: |
+          APP="build/DerivedData/Build/Products/Release-iphoneos/Ruzu.app"
+          test -d "$APP" || { echo "!! 没找到 Ruzu.app"; ls -R build/DerivedData/Build/Products || true; exit 1; }
+          echo "== App 内容 =="; ls -la "$APP"
+          echo "== 架构 =="; file "$APP/Ruzu"
+          mkdir -p dist/Payload
+          cp -R "$APP" dist/Payload/
+          cp ios/RuzuApp/RuzuApp.entitlements dist/RuzuApp.entitlements
+          cp ios/RuzuApp/RuzuApp-jailbreak.entitlements dist/Ruzu-jailbreak.entitlements
+          cd dist && zip -qry Ruzu-unsigned.ipa Payload
+          ls -la
+          echo "IPA 大小：$(du -h Ruzu-unsigned.ipa | cut -f1)"
+
+      - name: 上传产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ruzu-ios-${{ github.sha }}
+          path: |
+            dist/Ruzu-unsigned.ipa
+            dist/RuzuApp.entitlements
+            dist/Ruzu-jailbreak.entitlements
+            probe-logs/
+          retention-days: 30
+          if-no-files-found: warn
