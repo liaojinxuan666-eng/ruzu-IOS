@@ -39,6 +39,9 @@ targets:
       - sdk: CoreAudio.framework
       - sdk: AVFoundation.framework
       - sdk: GameController.framework
+      - sdk: CoreBluetooth.framework
+      - sdk: CoreHaptics.framework
+      - sdk: CoreMotion.framework
       - sdk: Security.framework
       - sdk: CoreMedia.framework
       - sdk: CoreVideo.framework
@@ -64,6 +67,7 @@ targets:
         # Rust 交叉编译产物：仓库根目录的 target/aarch64-apple-ios/release
         LIBRARY_SEARCH_PATHS:
           - "$(SRCROOT)/../target/aarch64-apple-ios/release"
+          - "$(SRCROOT)/../third_party/opus"
         # 静态库要在最后 link。
         # -lc++ / -liconv 等来自 `cargo rustc --print native-static-libs` 的输出
         # （Rust 静态库不自带这些系统库之外的东西，接了 core 之后必须补上）。
