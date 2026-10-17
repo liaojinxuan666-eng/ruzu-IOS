@@ -46,4 +46,9 @@ enum RuzuFFI {
     }
 
     static var coreLinkProbe: String { take(ruzu_ios_core_link_probe()) }
+
+    /// 阶段 1：加载（只加载，不渲染）。
+    static func loadGame(path: String) -> String {
+        path.withCString { take(ruzu_ios_load_game($0)) }
+    }
 }

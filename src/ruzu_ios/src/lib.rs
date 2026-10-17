@@ -22,6 +22,8 @@ use std::fmt::Write as _;
 
 mod core_link;
 #[cfg(feature = "core")]
+mod boot;
+#[cfg(feature = "core")]
 mod emu_window_ios;
 mod jitmem;
 mod nce_probe;
@@ -726,6 +728,32 @@ pub extern "C" fn ruzu_ios_window_probe(
     {
         let _ = (layer, width, height, scale);
         to_c_string("core 未接入（feature `core` 关闭），窗口自检跳过".to_string())
+    }
+}
+
+/// 阶段 1：加载一个游戏/家酿（.nro / .nsi / NSP 内 NCA 等，交给 loader 判断）。
+///
+/// 只做加载，不启动渲染 —— 用来确定性地验证：文件访问、加载器、客户机内存预留。
+#[no_mangle]
+pub extern "C" fn ruzu_ios_load_game(path: *const c_char) -> *mut c_char {
+    #[cfg(feature = "core")]
+    {
+        if path.is_null() {
+            return to_c_string("路径为空".to_string());
+        }
+        let p = unsafe { std::ffi::CStr::from_ptr(path) }
+            .to_string_lossy()
+            .into_owned();
+        log_line(&format!("=== 加载测试：{p} ==="));
+        let out = boot::load_game(&p);
+        log_line(&format!("结果 ok={}", out.ok));
+        log_line(&out.message);
+        to_c_string(out.message)
+    }
+    #[cfg(not(feature = "core"))]
+    {
+        let _ = path;
+        to_c_string("core 未接入（feature `core` 关闭），无法加载".to_string())
     }
 }
 

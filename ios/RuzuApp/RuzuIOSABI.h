@@ -41,6 +41,9 @@ char *ruzu_ios_window_probe(void *layer, uint32_t width, uint32_t height, float 
 /// core 链接探针（默认 feature 关闭时返回未接入）。
 char *ruzu_ios_core_link_probe(void);
 
+/// 阶段 1：加载游戏/家酿（只加载，不启动渲染）。
+char *ruzu_ios_load_game(const char *path);
+
 /// 释放上面几个函数返回的字符串。
 void ruzu_ios_free_string(char *s);
 

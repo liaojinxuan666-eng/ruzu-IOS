@@ -6,8 +6,9 @@
 import UIKit
 import Metal
 import QuartzCore
+import UniformTypeIdentifiers
 
-final class ViewController: UIViewController {
+final class ViewController: UIViewController, UIDocumentPickerDelegate {
 
     private let previewView = MetalPreviewView()
     private let textView = UITextView()
@@ -68,7 +69,11 @@ final class ViewController: UIViewController {
         windowProbe.setTitle("⑦ 窗口接入自检（Metal + core）", for: .normal)
         windowProbe.addTarget(self, action: #selector(runWindowProbe), for: .touchUpInside)
 
-        let buttons = UIStackView(arrangedSubviews: [safe, metal, unsigned, nce, selfTrace, logButton, windowProbe])
+        let loadButton = UIButton(type: .system)
+        loadButton.setTitle("⑧ 选择文件并加载（阶段 1）", for: .normal)
+        loadButton.addTarget(self, action: #selector(pickAndLoadGame), for: .touchUpInside)
+
+        let buttons = UIStackView(arrangedSubviews: [safe, metal, unsigned, nce, selfTrace, logButton, windowProbe, loadButton])
         buttons.axis = .vertical
         buttons.spacing = 8
 
@@ -193,6 +198,33 @@ final class ViewController: UIViewController {
             )
         }
     }
+    @objc private func pickAndLoadGame() {
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.data], asCopy: true)
+        picker.delegate = self
+        picker.allowsMultipleSelection = false
+        present(picker, animated: true)
+    }
+
+    func documentPicker(_ controller: UIDocumentPickerViewController,
+                        didPickDocumentsAt urls: [URL]) {
+        guard let url = urls.first else { return }
+        reset("加载测试（阶段 1）")
+        let dst = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent(url.lastPathComponent)
+        try? FileManager.default.removeItem(at: dst)
+        do {
+            try FileManager.default.copyItem(at: url, to: dst)
+            append("已拷入沙盒：\(dst.lastPathComponent)")
+            append("开始加载（客户机内存预留 + 解析，可能要几秒）…")
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let result = RuzuFFI.loadGame(path: dst.path)
+                DispatchQueue.main.async { self?.append(result) }
+            }
+        } catch {
+            append("[FAIL] 拷贝失败：\(error)")
+        }
+    }
+
 }
 
 /// 一个 CAMetalLayer 支撑的视图 —— 这就是后面 ruzu Metal 后端要渲染进去的宿主。
