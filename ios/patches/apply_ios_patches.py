@@ -226,36 +226,62 @@ _RH_MMAP_OLD = '''unsafe fn mmap_code_cache(size: usize) -> Result<NonNull<u8>, 
     NonNull::new(ptr.cast::<u8>()).ok_or_else(|| "mmap returned null".to_string())
 }'''
 
-_RH_MMAP_NEW = '''unsafe fn mmap_code_cache(size: usize) -> Result<NonNull<u8>, String> {
-    // iOS：按顺序试三种映射，第一个成功即用。
-    //   ① 普通 RWX 匿名映射（**iOS 的正确姿势**）—— 可执行性由代码签名授权
-    //      （dynamic-codesigning entitlement / CS_DEBUGGED）保证。
-    //      真机实测（iPhone11,6 / iOS 18.5）：这条 OK。
-    //   ②③ MAP_JIT 两个变体只作兜底 —— MAP_JIT 是 macOS 专有机制，
-    //      iOS 上实测 RWX+MAP_JIT 报 EINVAL、RW+MAP_JIT 报 EACCES。
+_RH_MMAP_NEW = '''unsafe fn mmap_code_cache(size: usize) -> Result<(NonNull<u8>, NonNull<u8>, bool), String> {
+    // iOS：**双视图映射**（V8 在 Apple 平台的 JIT 设计）
+    //   ① 映射一片 RW 作为"写视图"
+    //   ② 用 mach_vm_remap 把同一片**物理页**再映射成一个"执行视图"，并设成 R-X
+    //   这样写入和执行互不干扰：不需要任何权限翻转（零开销），也不会因为
+    //   某个线程正在 emit 而让另一个线程执行到 RW 页上（macOS 靠
+    //   pthread_jit_write_protect_np 的**每线程**写保护解决，iOS 没有那个符号）。
+    //   万一别名创建失败：退化为单视图，由 set_jit_write_protection() 用
+    //   mprotect 翻转"已使用的那部分"，慢一些但正确。
     #[cfg(target_os = "ios")]
     {
-        let anon = libc::MAP_PRIVATE | libc::MAP_ANON;
-        let jit = anon | libc::MAP_JIT;
-        let rw = libc::PROT_READ | libc::PROT_WRITE;
-        let rwx = rw | libc::PROT_EXEC;
-        // 真机实测：**一次性请求 RWX 会被内核剥掉 X 位**（W^X），页看着是 RWX 实际是 RW-。
-        // 所以 iOS 上优先按 RW 映射（可写），可执行性交给后续的 mprotect(RX)。
-        // 注：代码缓存的 W^X 翻转策略是下一步的工程任务 —— 每个块 emit 前后翻转整片
-        //     缓存太慢，正确做法是把同一片物理页映射成两个视图（RW 视图写、RX 视图执行，
-        //     即 V8 那种双映射设计，可用 mach_vm_remap 实现）。
-        for (prot, flags) in [(rw, anon), (rwx, anon), (rwx, jit)] {
-            let p = libc::mmap(std::ptr::null_mut(), size, prot, flags, -1, 0);
-            if p != libc::MAP_FAILED {
-                if let Some(n) = NonNull::new(p.cast::<u8>()) {
-                    return Ok(n);
+        let rw = libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        );
+        if rw == libc::MAP_FAILED {
+            return Err(format!(
+                "failed to allocate ARM64 code cache (iOS, RW): {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let rw_ptr = match NonNull::new(rw.cast::<u8>()) {
+            Some(p) => p,
+            None => return Err("mmap returned null".to_string()),
+        };
+
+        let mut exec_addr: u64 = 0;
+        let mut cur_prot: i32 = 0;
+        let mut max_prot: i32 = 0;
+        let kr = mach_vm_remap(
+            mach_task_self_,
+            &mut exec_addr,
+            size as u64,
+            0,
+            VM_FLAGS_ANYWHERE,
+            mach_task_self_,
+            rw as u64,
+            0, // copy = FALSE：共享同一片物理页
+            &mut cur_prot,
+            &mut max_prot,
+            0, // VM_INHERIT_NONE
+        );
+        if kr == 0 && exec_addr != 0 {
+            let exec_raw = exec_addr as *mut libc::c_void;
+            if libc::mprotect(exec_raw, size, libc::PROT_READ | libc::PROT_EXEC) == 0 {
+                if let Some(exec_ptr) = NonNull::new(exec_raw.cast::<u8>()) {
+                    return Ok((rw_ptr, exec_ptr, true));
                 }
             }
         }
-        return Err(format!(
-            "failed to allocate ARM64 executable code cache (iOS): {}",
-            std::io::Error::last_os_error()
-        ));
+        // 退路：没有别名可用
+        return Ok((rw_ptr, rw_ptr, false));
     }
 
     #[cfg(not(target_os = "ios"))]
@@ -280,7 +306,8 @@ _RH_MMAP_NEW = '''unsafe fn mmap_code_cache(size: usize) -> Result<NonNull<u8>, 
             ));
         }
 
-        NonNull::new(ptr.cast::<u8>()).ok_or_else(|| "mmap returned null".to_string())
+        let p = NonNull::new(ptr.cast::<u8>()).ok_or_else(|| "mmap returned null".to_string())?;
+        Ok((p, p, false))
     }
 }'''
 
@@ -304,8 +331,148 @@ edit(
             "    let _ = enabled;",
             "set_jit_write_protect 在 iOS 上走 dlsym 版本",
         ),
-        # iOS 的 mmap 姿势：分两步试，先 WebKit 姿势（RW + MAP_JIT），再退回 RWX
-        (_RH_MMAP_OLD, _RH_MMAP_NEW, "iOS 的 JIT 内存映射改用梯子式尝试"),
+        # iOS 的 mmap 姿势 + 双视图 W^X
+        (_RH_MMAP_OLD, _RH_MMAP_NEW, "iOS 的 JIT 内存映射改用双视图（RW 写 + RX 执行）"),
+        # 双视图所需的 Mach 接口（挂在 ios_set_jit_write_protect 之后）
+        (
+            "    if let Some(f) = f {\n        f(enabled as i32);\n    }\n}",
+            "    if let Some(f) = f {\n        f(enabled as i32);\n    }\n"
+            "}\n\n"
+            "// iOS 双视图 JIT 映射所需的 Mach 接口。\n"
+            "// mach_vm_remap 可以把同一片**物理页**再映射成一个新地址（别名），\n"
+            "// 从而做到「一个视图写、一个视图执行」，完全不需要翻转权限。\n"
+            '#[cfg(all(target_os = "ios", target_arch = "aarch64"))]\n'
+            'extern "C" {\n'
+            "    static mach_task_self_: u32;\n"
+            "    fn mach_vm_remap(\n"
+            "        target_task: u32,\n"
+            "        target_address: *mut u64,\n"
+            "        size: u64,\n"
+            "        mask: u64,\n"
+            "        flags: i32,\n"
+            "        src_task: u32,\n"
+            "        src_address: u64,\n"
+            "        copy: i32,\n"
+            "        cur_protection: *mut i32,\n"
+            "        max_protection: *mut i32,\n"
+            "        inheritance: u32,\n"
+            "    ) -> i32;\n"
+            "}\n\n"
+            '#[cfg(all(target_os = "ios", target_arch = "aarch64"))]\n'
+            "const VM_FLAGS_ANYWHERE: i32 = 1;",
+            "加入 mach_vm_remap 的 FFI 声明",
+        ),
+        # 结构体加两个字段
+        (
+            "/// Executable AArch64 code buffer.\n"
+            "pub struct BlockOfCode {\n"
+            "    ptr: NonNull<u8>,\n"
+            "    size: usize,\n"
+            "    cursor: usize,\n"
+            "    jit_write_protection_enabled: bool,\n"
+            "}",
+            "/// Executable AArch64 code buffer.\n"
+            "pub struct BlockOfCode {\n"
+            "    /// 写入视图（RW）。\n"
+            "    ptr: NonNull<u8>,\n"
+            "    /// 执行视图（R-X）。iOS 上它与 `ptr` 是**同一片物理页的另一个映射**，\n"
+            "    /// 所以写入和执行互不干扰、无需任何权限翻转（性能关键）。\n"
+            "    /// 别名创建失败时退化为与 `ptr` 相同。\n"
+            "    exec_ptr: NonNull<u8>,\n"
+            "    /// 双视图是否生效\n"
+            "    has_exec_alias: bool,\n"
+            "    size: usize,\n"
+            "    cursor: usize,\n"
+            "    jit_write_protection_enabled: bool,\n"
+            "}",
+            "BlockOfCode 增加执行视图字段",
+        ),
+        # with_size 接新返回值
+        (
+            "        let ptr = unsafe { mmap_code_cache(size)? };\n"
+            "        Ok(Self {\n"
+            "            ptr,\n"
+            "            size,\n"
+            "            cursor: 0,\n"
+            "            jit_write_protection_enabled: true,\n"
+            "        })",
+            "        let (ptr, exec_ptr, has_exec_alias) = unsafe { mmap_code_cache(size)? };\n"
+            "        Ok(Self {\n"
+            "            ptr,\n"
+            "            exec_ptr,\n"
+            "            has_exec_alias,\n"
+            "            size,\n"
+            "            cursor: 0,\n"
+            "            jit_write_protection_enabled: true,\n"
+            "        })",
+            "with_size 接收双视图返回值",
+        ),
+        # 对外暴露的代码基址 = 执行视图
+        (
+            "    pub fn code_base_ptr(&self) -> *const u8 {\n        self.ptr.as_ptr()\n    }",
+            "    /// 注意：返回的是**执行视图**。写入走 `ptr`，执行走这里 —— \n"
+            "    /// 上层所有「算出来的代码地址」都会指向可执行的那份映射。\n"
+            "    pub fn code_base_ptr(&self) -> *const u8 {\n        self.exec_ptr.as_ptr()\n    }",
+            "code_base_ptr 返回执行视图",
+        ),
+        # 权限翻转：有别名就什么都不用做
+        (
+            "    unsafe fn set_jit_write_protection(&mut self, enabled: bool) {\n"
+            "        if self.jit_write_protection_enabled == enabled {\n"
+            "            return;\n"
+            "        }\n"
+            "        set_jit_write_protect(enabled);\n"
+            "        self.jit_write_protection_enabled = enabled;\n"
+            "    }",
+            "    unsafe fn set_jit_write_protection(&mut self, enabled: bool) {\n"
+            "        if self.jit_write_protection_enabled == enabled {\n"
+            "            return;\n"
+            "        }\n"
+            '        #[cfg(target_os = "ios")]\n'
+            "        {\n"
+            "            // 有执行别名时**什么都不用做**：写视图永远可写、执行视图永远可执行，\n"
+            "            // 这正是双视图设计的价值（零开销、也不会和别的线程抢权限）。\n"
+            "            if !self.has_exec_alias {\n"
+            "                // 退路：只能把「已使用的那部分」按需翻转，比整片翻转便宜得多。\n"
+            "                let page: usize = 0x1000;\n"
+            "                let used = ((self.cursor + page - 1) & !(page - 1)).min(self.size);\n"
+            "                if used > 0 {\n"
+            "                    let prot = if enabled {\n"
+            "                        libc::PROT_READ | libc::PROT_EXEC\n"
+            "                    } else {\n"
+            "                        libc::PROT_READ | libc::PROT_WRITE\n"
+            "                    };\n"
+            "                    libc::mprotect(self.ptr.as_ptr() as *mut libc::c_void, used, prot);\n"
+            "                }\n"
+            "            }\n"
+            "        }\n"
+            "        set_jit_write_protect(enabled);\n"
+            "        self.jit_write_protection_enabled = enabled;\n"
+            "    }",
+            "iOS 上有别名时跳过权限翻转",
+        ),
+        # Drop 要释放两个视图
+        (
+            "impl Drop for BlockOfCode {\n"
+            "    fn drop(&mut self) {\n"
+            "        unsafe {\n"
+            "            libc::munmap(self.ptr.as_ptr().cast::<c_void>(), self.size);\n"
+            "        }\n"
+            "    }\n"
+            "}",
+            "impl Drop for BlockOfCode {\n"
+            "    fn drop(&mut self) {\n"
+            "        unsafe {\n"
+            "            // 两个视图都要释放（它们各自是一次独立的映射）\n"
+            "            if self.exec_ptr != self.ptr {\n"
+            "                libc::munmap(self.exec_ptr.as_ptr().cast::<c_void>(), self.size);\n"
+            "            }\n"
+            "            libc::munmap(self.ptr.as_ptr().cast::<c_void>(), self.size);\n"
+            "        }\n"
+            "    }\n"
+            "}",
+            "Drop 释放执行视图",
+        ),
     ],
 )
 

@@ -416,12 +416,17 @@ fn probe_signal_recovery(out: &mut String) {
             mask: 0,
             flags: 0,
         };
+        // 注意：USR1_HITS 是 static，**不能**直接用 `== 1` 判成功 ——
+        // 第二次跑这个按钮时它会累计成 2，导致"一会好一会坏"的假失败。
+        // 正确做法是看增量。
+        let before = USR1_HITS;
         if sigaction(SIGUSR1, &act2, std::ptr::null_mut()) == 0 {
             raise(SIGUSR1);
-            if USR1_HITS == 1 {
-                writeln!(out, "[OK]   ④-c 信号送达处理器（SIGUSR1 命中 1 次）").unwrap();
+            let hits = USR1_HITS - before;
+            if hits == 1 {
+                writeln!(out, "[OK]   ④-c 信号送达处理器（本次命中 {hits} 次）").unwrap();
             } else {
-                writeln!(out, "[FAIL] ④-c 信号没送到处理器（命中 {USR1_HITS} 次）").unwrap();
+                writeln!(out, "[FAIL] ④-c 本次信号命中 {hits} 次（期望 1）").unwrap();
             }
         } else {
             writeln!(out, "[FAIL] ④-c 注册 SIGUSR1 处理器失败 errno={}", *libc::__error()).unwrap();

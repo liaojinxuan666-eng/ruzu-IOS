@@ -20,6 +20,7 @@
 use std::ffi::{c_char, c_int, c_void, CString};
 use std::fmt::Write as _;
 
+mod core_link;
 mod jitmem;
 mod nce_probe;
 
@@ -633,6 +634,8 @@ pub extern "C" fn ruzu_ios_diagnostics() -> *mut c_char {
     s.push_str(&jit);
     writeln!(s, "\n=== 客户机内存预留（PROT_NONE + MAP_NORESERVE）===").unwrap();
     s.push_str(&probe_reservation());
+    writeln!(s, "\n=== 模拟器核心接入状态 ===").unwrap();
+    writeln!(s, "{}", core_status()).unwrap();
     writeln!(s, "\n=== 判定 ===").unwrap();
     if jit.contains('★') {
         writeln!(s, "→ JIT 通路已打通：机器码真的执行了。地基全齐，可以开始接 ruzu 核心了。").unwrap();
@@ -670,6 +673,26 @@ pub extern "C" fn ruzu_ios_jit_probe_unsafe() -> *mut c_char {
 #[no_mangle]
 pub extern "C" fn ruzu_ios_nce_precheck() -> *mut c_char {
     to_c_string(nce_probe::precheck())
+}
+
+/// 当前二进制有没有把模拟器核心接进来。
+fn core_status() -> String {
+    #[cfg(feature = "core")]
+    {
+        core_link::link_probe()
+    }
+    #[cfg(not(feature = "core"))]
+    {
+        "core 未接入（Cargo feature `core` 关闭）—— 默认状态：先保证 IPA 永远能编出来，\
+         链路验证由 CI 的独立步骤做"
+            .to_string()
+    }
+}
+
+/// core 链接探针（给 Swift 用）。
+#[no_mangle]
+pub extern "C" fn ruzu_ios_core_link_probe() -> *mut c_char {
+    to_c_string(core_status())
 }
 
 #[no_mangle]
