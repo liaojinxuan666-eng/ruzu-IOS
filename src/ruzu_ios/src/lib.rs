@@ -264,6 +264,14 @@ fn codesign_report() -> String {
 
 static LOG_PATH: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
 
+/// 预打开的日志 fd（O_APPEND），专供信号处理器做 async-signal-safe 写入。
+static LOG_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+#[no_mangle]
+pub extern "C" fn ruzu_log_fd() -> c_int {
+    LOG_FD.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[no_mangle]
 pub extern "C" fn ruzu_ios_set_log_path(path: *const c_char) {
     if path.is_null() {
@@ -272,8 +280,15 @@ pub extern "C" fn ruzu_ios_set_log_path(path: *const c_char) {
     let p = unsafe { std::ffi::CStr::from_ptr(path) }
         .to_string_lossy()
         .into_owned();
+    // 预打开一个只追加的 fd，供信号处理器直接 write()
+    if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+        use std::os::unix::io::AsRawFd;
+        let fd = file.as_raw_fd();
+        LOG_FD.store(fd, std::sync::atomic::Ordering::Relaxed);
+        std::mem::forget(file); // 故意泄漏：进程生命周期内都要保持打开
+    }
     if let Ok(mut g) = LOG_PATH.lock() {
-        *g = Some(std::path::PathBuf::from(p));
+        *g = Some(std::path::PathBuf::from(&p));
     }
     // 路径就绪后立刻接管 log，保证核心的早期日志也能写进来
     install_logger();
