@@ -1113,71 +1113,69 @@ edit(
 # ---------------------------------------------------------------------------
 # 14. renderer_metal：profile 每个字段查询都打日志（定位 macOS 专有 selector）
 # ---------------------------------------------------------------------------
-# 崩溃报告显示是 ObjC 异常穿过 Rust 帧（__rust_foreign_exception → abort），
+# 崩溃报告显示是 ObjC 异常穿过 Rust 帧（__rust_foreign_exception -> abort），
 # 说明 query() 结构体里还有 iOS 上不存在的 selector。这里给每个查询加一行日志，
 # 并把**确定是 macOS 专有**的两个按平台短路（语义上 iOS 本来就不支持）。
+#
+# 注意：替换时必须保留 `字段名: ` 前缀 —— 上次就是这么把 12 个字段名删掉，
+# 导致整个 core 构建失败（结构体字面量里出现裸 `qf!(...)`）。
 edit(
     "src/video_core/src/renderer_metal/metal_device.rs",
     [
         (
             'has_unified_memory: device.hasUnifiedMemory(),',
-            'qf!("hasUnifiedMemory", device.hasUnifiedMemory())',
+            'has_unified_memory: qf!("hasUnifiedMemory", device.hasUnifiedMemory()),',
             "字段日志: has_unified_memory",
         ),
         (
             'recommended_max_working_set_size: device.recommendedMaxWorkingSetSize(),',
-            'qf!("recommendedMaxWorkingSetSize", device.recommendedMaxWorkingSetSize())',
+            'recommended_max_working_set_size: qf!("recommendedMaxWorkingSetSize", device.recommendedMaxWorkingSetSize()),',
             "字段日志: recommended_max_working_set_size",
         ),
         (
             'max_buffer_length: device.maxBufferLength(),',
-            'qf!("maxBufferLength", device.maxBufferLength())',
+            'max_buffer_length: qf!("maxBufferLength", device.maxBufferLength()),',
             "字段日志: max_buffer_length",
         ),
         (
             'max_threadgroup_memory_length: device.maxThreadgroupMemoryLength(),',
-            'qf!("maxThreadgroupMemoryLength", device.maxThreadgroupMemoryLength())',
+            'max_threadgroup_memory_length: qf!("maxThreadgroupMemoryLength", device.maxThreadgroupMemoryLength()),',
             "字段日志: max_threadgroup_memory_length",
         ),
         (
             'max_argument_buffer_sampler_count: device.maxArgumentBufferSamplerCount(),',
-            'qf!("maxArgumentBufferSamplerCount", device.maxArgumentBufferSamplerCount())',
+            'max_argument_buffer_sampler_count: qf!("maxArgumentBufferSamplerCount", device.maxArgumentBufferSamplerCount()),',
             "字段日志: max_argument_buffer_sampler_count",
         ),
         (
             'argument_buffers_tier: device.argumentBuffersSupport(),',
-            'qf!("argumentBuffersSupport", device.argumentBuffersSupport())',
+            'argument_buffers_tier: qf!("argumentBuffersSupport", device.argumentBuffersSupport()),',
             "字段日志: argument_buffers_tier",
         ),
         (
             'read_write_texture_tier: device.readWriteTextureSupport(),',
-            'qf!("readWriteTextureSupport", device.readWriteTextureSupport())',
+            'read_write_texture_tier: qf!("readWriteTextureSupport", device.readWriteTextureSupport()),',
             "字段日志: read_write_texture_tier",
         ),
         (
             'supports_raster_order_groups: device.areRasterOrderGroupsSupported(),',
-            'qf!("areRasterOrderGroupsSupported", device.areRasterOrderGroupsSupported())',
+            'supports_raster_order_groups: qf!("areRasterOrderGroupsSupported", device.areRasterOrderGroupsSupported()),',
             "字段日志: supports_raster_order_groups",
         ),
         (
             'supports_32bit_float_filtering: device.supports32BitFloatFiltering(),',
-            'qf!("supports32BitFloatFiltering", device.supports32BitFloatFiltering())',
+            'supports_32bit_float_filtering: qf!("supports32BitFloatFiltering", device.supports32BitFloatFiltering()),',
             "字段日志: supports_32bit_float_filtering",
         ),
         (
             'supports_32bit_msaa: device.supports32BitMSAA(),',
-            'qf!("supports32BitMSAA", device.supports32BitMSAA())',
+            'supports_32bit_msaa: qf!("supports32BitMSAA", device.supports32BitMSAA()),',
             "字段日志: supports_32bit_msaa",
         ),
         (
             'supports_query_texture_lod: device.supportsQueryTextureLOD(),',
-            'qf!("supportsQueryTextureLOD", device.supportsQueryTextureLOD())',
+            'supports_query_texture_lod: qf!("supportsQueryTextureLOD", device.supportsQueryTextureLOD()),',
             "字段日志: supports_query_texture_lod",
-        ),
-        (
-            'supports_pull_model_interpolation: device.supportsPullModelInterpolation(),',
-            '// pull-model 插值是 macOS 专有特性；iOS 上直接为 false，避免调 macOS 专有 selector\n            supports_pull_model_interpolation: cfg!(target_os = "macos")\n                && qf!("supportsPullModelInterpolation", device.supportsPullModelInterpolation()),',
-            "字段日志: supports_pull_model_interpolation",
         ),
         (
             'supports_shader_barycentrics: device.supportsShaderBarycentricCoordinates(),',
@@ -1185,23 +1183,35 @@ edit(
             "字段日志: supports_shader_barycentrics",
         ),
         (
-            'supports_function_pointers: objc2::available!(macos = 11.0, ..)\n                && device.supportsFunctionPointers(),',
-            'supports_function_pointers: objc2::available!(macos = 11.0, ios = 14.0, ..)\n                && qf!("supportsFunctionPointers", device.supportsFunctionPointers()),',
+            "supports_pull_model_interpolation: device.supportsPullModelInterpolation(),",
+            '            // pull-model 插值是 macOS 专有特性；iOS 上直接 false\n'
+            '            supports_pull_model_interpolation: cfg!(target_os = "macos")\n'
+            '                && qf!("supportsPullModelInterpolation", device.supportsPullModelInterpolation()),',
+            "字段日志: supports_pull_model_interpolation（平台短路）",
+        ),
+        (
+            "supports_function_pointers: objc2::available!(macos = 11.0, ..)\n                && device.supportsFunctionPointers(),",
+            '            supports_function_pointers: objc2::available!(macos = 11.0, ios = 14.0, ..)\n'
+            '                && qf!("supportsFunctionPointers", device.supportsFunctionPointers()),',
             "字段日志: supports_function_pointers",
         ),
         (
-            'supports_raytracing: objc2::available!(macos = 11.0, ..) && device.supportsRaytracing(),',
-            'supports_raytracing: objc2::available!(macos = 11.0, ios = 17.0, ..)\n                && qf!("supportsRaytracing", device.supportsRaytracing()),',
+            "supports_raytracing: objc2::available!(macos = 11.0, ..) && device.supportsRaytracing(),",
+            '            supports_raytracing: objc2::available!(macos = 11.0, ios = 17.0, ..)\n'
+            '                && qf!("supportsRaytracing", device.supportsRaytracing()),',
             "字段日志: supports_raytracing",
         ),
         (
-            'supports_depth24_stencil8: device.isDepth24Stencil8PixelFormatSupported(),',
-            '// isDepth24Stencil8PixelFormatSupported 是 macOS 专有\n            supports_depth24_stencil8: cfg!(target_os = "macos")\n                && qf!("isDepth24Stencil8PixelFormatSupported", device.isDepth24Stencil8PixelFormatSupported()),',
-            "字段日志: supports_depth24_stencil8",
+            "supports_depth24_stencil8: device.isDepth24Stencil8PixelFormatSupported(),",
+            '            // isDepth24Stencil8PixelFormatSupported 是 macOS 专有\n'
+            '            supports_depth24_stencil8: cfg!(target_os = "macos")\n'
+            '                && qf!("isDepth24Stencil8PixelFormatSupported", device.isDepth24Stencil8PixelFormatSupported()),',
+            "字段日志: supports_depth24_stencil8（平台短路）",
         ),
         (
-            'sample_counts: [1, 2, 4, 8, 16]\n                .map(|samples| device.supportsTextureSampleCount(samples)),',
-            'sample_counts: [1, 2, 4, 8, 16]\n                .map(|samples| qf!("supportsTextureSampleCount", device.supportsTextureSampleCount(samples))),',
+            "sample_counts: [1, 2, 4, 8, 16]\n                .map(|samples| device.supportsTextureSampleCount(samples)),",
+            '            sample_counts: [1, 2, 4, 8, 16]\n'
+            '                .map(|samples| qf!("supportsTextureSampleCount", device.supportsTextureSampleCount(samples))),',
             "字段日志: sample_counts",
         ),
     ],
@@ -1230,6 +1240,30 @@ edit(
 )
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 补丁后自检：抓「明显写坏」的模式
+# ---------------------------------------------------------------------------
+# 教训：有一次替换把 `has_unified_memory: ` 前缀一起删掉，结构体字面量里变成了
+# 裸 `qf!(...)`，整个 core 构建失败，直到 CI 才暴露。这里做一次廉价的自检。
+def sanity_check():
+    bad = []
+    path = os.path.join(ROOT, "src/video_core/src/renderer_metal/metal_device.rs")
+    if os.path.exists(path):
+        for lineno, line in enumerate(_read(path).splitlines(), 1):
+            stripped = line.strip()
+            # 结构体字段位置出现裸宏调用 → 一定少了字段名
+            if stripped.startswith("qf!(") and stripped.endswith(","):
+                bad.append(f"metal_device.rs:{lineno} 结构体字段缺少名字：{stripped[:60]}")
+    if bad:
+        print("\n⚠️  自检发现问题：")
+        for item in bad:
+            print("   -", item)
+    else:
+        print("\n✅ 自检通过（SANITY: 裸 qf! 检查）")
+
+
+sanity_check()
+
 print()
 print(f"=== 补丁完成：{changed} 个文件被修改 ===")
 if problems:
