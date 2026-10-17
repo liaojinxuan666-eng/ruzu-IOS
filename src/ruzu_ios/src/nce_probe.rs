@@ -247,70 +247,83 @@ fn probe_exclusive_monitor(out: &mut String) {
         }
         crate::log_line("NCE③: 即将多线程执行独占监视器测试");
 
-        // **数据绝对不能放在代码页里**：写完代码后整页是 R-X（只读），
-        // 往里面写会立刻 SIGBUS —— 2026-10-17 真机就是崩在这一行。
-        // 用栈上的变量当计数器即可（独占监视器对任何地址都有效）。
-        let rmw: extern "C" fn(*mut u32) -> u32 = std::mem::transmute(page);
-        let mut local_counter: u32 = 0;
-        let counter: *mut u32 = &mut local_counter;
-
-        // 多线程要用地址（usize），裸指针不是 Send，不能直接跨线程捕获
-        let counter_addr = counter as usize;
-
-        // 单线程：一次成功
-        let mut attempts = 0u64;
-        loop {
-            attempts += 1;
-            if rmw(counter) == 0 {
-                break;
-            }
-            if attempts > 1000 {
-                break;
-            }
-        }
-        let single = *counter;
-
-        // 多线程竞争：4 线程各做 50_000 次成功递增，最终必须刚好等于 200_000。
-        // 如果独占监视器语义不对（比如 STXR 假成功），这里会少算 —— 那 NCE 的
-        // 客户机互斥/引用计数就会出错，属于致命问题。
-        *counter = 0;
+        // 独占监视器是**有竞争**的测试，单次结果可能有偶然性，
+        // 所以这里连跑 3 轮并逐轮记录 —— 这样"时好时坏"就能一眼看出
+        // 是「3/3 全过」（偶然噪声）还是「2/3 过」（真的不稳）。
+        const ROUNDS: usize = 3;
         const THREADS: u32 = 4;
         const PER_THREAD: u32 = 50_000;
-        let total = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let mut handles = Vec::new();
-        for _ in 0..THREADS {
-            let total = total.clone();
-            let rmw = rmw;
-            handles.push(std::thread::spawn(move || {
-                let ptr = counter_addr as *mut u32;
-                let mut done = 0u32;
-                let mut spins = 0u64;
-                while done < PER_THREAD && spins < 50_000_000 {
-                    spins += 1;
-                    if rmw(ptr) == 0 {
-                        done += 1;
-                    }
-                }
-                total.fetch_add(done as u64, std::sync::atomic::Ordering::Relaxed);
-            }));
-        }
-        for h in handles {
-            let _ = h.join();
-        }
-        let expected = (THREADS * PER_THREAD) as u32;
-        let actual = *counter;
-        let reported = total.load(std::sync::atomic::Ordering::Relaxed);
+        let mut all_ok = true;
+        let mut detail = String::new();
 
-        if single == 1 && actual == expected && reported == expected as u64 {
-            writeln!(out, "[OK]   ③ 独占监视器正确（单线程 {single}；{THREADS} 线程 × {PER_THREAD} 次 → 期望 {expected}，实测 {actual}）").unwrap();
+        for round in 1..=ROUNDS {
+            // **数据绝对不能放在代码页里**：写完代码后整页是 R-X（只读），
+            // 往里面写会立刻 SIGBUS（2026-10-17 真机就是崩在这一行）。
+            // 用栈上的变量当计数器即可（独占监视器对任何地址都有效）。
+            let rmw: extern "C" fn(*mut u32) -> u32 = std::mem::transmute(page);
+            let mut local_counter: u32 = 0;
+            let counter: *mut u32 = &mut local_counter;
+            let counter_addr = counter as usize;
+
+            // 单线程：应当一次就成功
+            let mut attempts = 0u64;
+            while attempts <= 1000 {
+                attempts += 1;
+                if rmw(counter) == 0 {
+                    break;
+                }
+            }
+            let single = *counter;
+
+            // 多线程竞争：4 线程各成功递增 50_000 次，最终必须**刚好**等于 200_000。
+            // 少算 = STXR 假成功（丢更新）→ NCE 下客户机互斥会出错，属致命问题。
+            *counter = 0;
+            let total = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let mut handles = Vec::new();
+            for _ in 0..THREADS {
+                let total = total.clone();
+                handles.push(std::thread::spawn(move || {
+                    let ptr = counter_addr as *mut u32;
+                    let mut done = 0u32;
+                    let mut spins = 0u64;
+                    while done < PER_THREAD && spins < 50_000_000 {
+                        spins += 1;
+                        if rmw(ptr) == 0 {
+                            done += 1;
+                        }
+                    }
+                    total.fetch_add(done as u64, std::sync::atomic::Ordering::Relaxed);
+                }));
+            }
+            for h in handles {
+                let _ = h.join();
+            }
+            let expected = (THREADS * PER_THREAD) as u32;
+            let actual = *counter;
+            let reported = total.load(std::sync::atomic::Ordering::Relaxed);
+            let ok = single == 1 && actual == expected && reported == expected as u64;
+            all_ok &= ok;
+            writeln!(
+                detail,
+                "     第 {round}/{ROUNDS} 轮：单线程 {single}；多线程期望 {expected} 实测 {actual}（线程自报 {reported}）{}",
+                if ok { "✓" } else { "✗" }
+            )
+            .unwrap();
+            crate::log_line(&format!(
+                "NCE③ 第 {round}/{ROUNDS} 轮：single={single} expected={expected} actual={actual} reported={reported} ok={ok}"
+            ));
+        }
+
+        if all_ok {
+            writeln!(out, "[OK]   ③ 独占监视器 {ROUNDS} 轮全部正确：").unwrap();
         } else {
             writeln!(
                 out,
-                "[FAIL] ③ 独占监视器异常：单线程 {single}（期望 1）；多线程期望 {expected}，实测计数 {actual}（线程自报 {reported}）\n\
-                 　　→ 丢更新意味着 NCE 下客户机互斥会出问题，得改用别的同步策略"
+                "[FAIL] ③ 独占监视器不稳定（{ROUNDS} 轮里有失败项）—— 这会导致 NCE 下客户机互斥丢更新："
             )
             .unwrap();
         }
+        out.push_str(&detail);
 
         libc::munmap(page as *mut c_void, 64 * 1024);
     }
@@ -367,7 +380,7 @@ fn probe_signal_recovery(out: &mut String) {
     unsafe {
         // ① 注册 SIGSEGV / SIGBUS 处理器
         let act = SigAction {
-            handler: segv_handler as usize,
+            handler: segv_handler as *const () as usize,
             mask: 0,
             flags: 0,
         };
@@ -410,24 +423,34 @@ fn probe_signal_recovery(out: &mut String) {
             writeln!(out, "[FAIL] ④-b 给备用信号栈分配内存失败 errno={}", *libc::__error()).unwrap();
         }
 
-        // ③ 自己发一个信号，确认能送到处理器（这一路完全不涉及跳转，不会崩）
+        // ③ 自己发一个信号，确认能送到处理器（这一路完全不涉及跳转，不会崩）。
+        //    连做 3 轮，逐轮记录 —— 这是排查"时好时坏"最省事的做法。
         let act2 = SigAction {
-            handler: usr1_handler as usize,
+            handler: usr1_handler as *const () as usize,
             mask: 0,
             flags: 0,
         };
-        // 注意：USR1_HITS 是 static，**不能**直接用 `== 1` 判成功 ——
-        // 第二次跑这个按钮时它会累计成 2，导致"一会好一会坏"的假失败。
-        // 正确做法是看增量。
-        let before = USR1_HITS;
         if sigaction(SIGUSR1, &act2, std::ptr::null_mut()) == 0 {
-            raise(SIGUSR1);
-            let hits = USR1_HITS - before;
-            if hits == 1 {
-                writeln!(out, "[OK]   ④-c 信号送达处理器（本次命中 {hits} 次）").unwrap();
-            } else {
-                writeln!(out, "[FAIL] ④-c 本次信号命中 {hits} 次（期望 1）").unwrap();
+            let mut ok_rounds = 0;
+            let mut detail = String::new();
+            for round in 1..=3 {
+                // 注意：USR1_HITS 是 static，**不能**直接用 `== 1` 判成功 ——
+                // 第二次跑这个按钮时它会累计成 2（这就是之前"时好时坏"的根因）。
+                let before = USR1_HITS;
+                raise(SIGUSR1);
+                let hits = USR1_HITS - before;
+                if hits == 1 {
+                    ok_rounds += 1;
+                }
+                writeln!(detail, "     第 {round}/3 轮：本次命中 {hits} 次{}", if hits == 1 { " ✓" } else { " ✗" }).unwrap();
+                crate::log_line(&format!("NCE④-c 第 {round}/3 轮：hits={hits}"));
             }
+            if ok_rounds == 3 {
+                writeln!(out, "[OK]   ④-c 信号送达处理器（3 轮全部命中 1 次）：").unwrap();
+            } else {
+                writeln!(out, "[FAIL] ④-c 信号送达不稳定（3 轮里只有 {ok_rounds} 轮正确）：").unwrap();
+            }
+            out.push_str(&detail);
         } else {
             writeln!(out, "[FAIL] ④-c 注册 SIGUSR1 处理器失败 errno={}", *libc::__error()).unwrap();
         }
@@ -463,5 +486,8 @@ pub fn precheck() -> String {
     } else {
         writeln!(out, "→ 有前提不成立。若失败的是①②，说明 JIT 权限还没开；若是③，需要针对 Apple 平台重做同步策略。").unwrap();
     }
+    // 把完整报告也写进日志：万一界面来不及看，或者想对比多次运行的结果，
+    // 直接看 Documents/nce_probe.log 即可。
+    crate::log_line(&out);
     out
 }

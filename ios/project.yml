@@ -46,10 +46,16 @@ targets:
         # Rust 交叉编译产物：仓库根目录的 target/aarch64-apple-ios/release
         LIBRARY_SEARCH_PATHS:
           - "$(SRCROOT)/../target/aarch64-apple-ios/release"
-        # 静态库要在最后 link；-lc++ 是给以后的 C++ 依赖（cubeb / spirv-cross）预留的
+        # 静态库要在最后 link。
+        # -lc++ / -liconv 等来自 `cargo rustc --print native-static-libs` 的输出
+        # （Rust 静态库不自带这些系统库之外的东西，接了 core 之后必须补上）。
         OTHER_LDFLAGS:
           - "-lruzu_ios"
           - "-lc++"
+          - "-liconv"
+          - "-lSystem"
+          - "-lc"
+          - "-lm"
         # 关掉一堆对静态库+无签名构建多余的东西
         DEAD_CODE_STRIPPING: YES
         STRIP_INSTALLED_PRODUCT: NO
