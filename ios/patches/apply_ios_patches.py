@@ -1049,6 +1049,67 @@ edit(
     ],
 )
 
+
+# ---------------------------------------------------------------------------
+# 12. renderer_metal：MetalDeviceProfile::query 分段日志
+# ---------------------------------------------------------------------------
+# 修掉 architecture() 之后仍在同一个 SIGABRT 崩（pc 相同 = objc 异常 abort），
+# 说明 query() 里还有 macOS 专有 selector。逐段打日志，一次定位到具体调用。
+edit(
+    "src/video_core/src/renderer_metal/metal_device.rs",
+    [
+        (
+            "        let highest_apple_family = [",
+            '        log::info!("[metal] query 1/6 supportsFamily 阶梯");\n'
+            "        let highest_apple_family = [",
+            "query 检查点 1",
+        ),
+        (
+            "        let max_threads = device.maxThreadsPerThreadgroup();",
+            '        log::info!("[metal] query 2/6 maxThreadsPerThreadgroup");\n'
+            "        let max_threads = device.maxThreadsPerThreadgroup();",
+            "query 检查点 2",
+        ),
+        (
+            "        let supports_mac2_family = device.supportsFamily(MTLGPUFamily::Mac2);",
+            '        log::info!("[metal] query 3/6 mac2/metal3/metal4 family");\n'
+            "        let supports_mac2_family = device.supportsFamily(MTLGPUFamily::Mac2);",
+            "query 检查点 3",
+        ),
+        (
+            "        let msl_language_version = select_msl_language_version(highest_apple_family.is_some());",
+            '        log::info!("[metal] query 4/6 选择 MSL 版本");\n'
+            "        let msl_language_version = select_msl_language_version(highest_apple_family.is_some());",
+            "query 检查点 4",
+        ),
+        (
+            "        let family_limits = family_limits(highest_apple_family);",
+            '        log::info!("[metal] query 5/6 直接查询设备上限");\n'
+            "        let family_limits = family_limits(highest_apple_family);",
+            "query 检查点 5",
+        ),
+    ],
+)
+
+# ---------------------------------------------------------------------------
+# 13. renderer_metal：iOS 上不要查询 BC 压缩纹理支持
+# ---------------------------------------------------------------------------
+# iOS 的 GPU 从不支持 BC（那是 macOS/桌面显卡的格式），而这个 selector 在
+# 部分 SDK 上属于 macOS 专有 —— 在 iOS 上调用同样会抛 unrecognized selector。
+# 直接按平台判定为 false，既正确又避免风险。
+edit(
+    "src/video_core/src/renderer_metal/metal_device.rs",
+    [
+        (
+            "            supports_bc_texture_compression: device.supportsBCTextureCompression(),",
+            "            // iOS GPU 不支持 BC 压缩纹理（桌面格式），也避免调用 macOS 专有 selector\n"
+            "            supports_bc_texture_compression: cfg!(target_os = \"macos\")\n"
+            "                && device.supportsBCTextureCompression(),",
+            "supportsBCTextureCompression 在 iOS 上直接为 false",
+        ),
+    ],
+)
+
 # ---------------------------------------------------------------------------
 print()
 print(f"=== 补丁完成：{changed} 个文件被修改 ===")
