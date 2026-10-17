@@ -978,6 +978,77 @@ edit(
     ],
 )
 
+
+# ---------------------------------------------------------------------------
+# 11. renderer_metal：MSL 版本与 mathMode 必须按「所在平台」的版本判断
+# ---------------------------------------------------------------------------
+# `objc2::available!(macos = X, ..)` 在 iOS 上会拿 **iOS 版本号** 和 X 比。
+# 后果不是崩溃就是选错版本：
+#   * select_msl_language_version() 在 iOS 18.5 上会选 V3_2（因为 18.5 >= 15）
+#     —— 恰好 iOS 18 支持，但换到 iOS 16 设备就会选中根本不支持的语言版本，
+#     着色器编译必然失败；
+#   * setMathMode(MTLMathMode::Safe) 的门控同理（该属性 iOS 18+ 才有，
+#     iOS 15~17 调用会 unrecognized selector → abort）。
+# 修法：显式增加 ios = 版本 的条件（两个平台各自比较自己的版本号）。
+edit(
+    "src/video_core/src/renderer_metal/metal_device.rs",
+    [
+        (
+            "fn select_msl_language_version(is_apple_silicon: bool) -> MslVersion {",
+            "fn select_msl_language_version(is_apple_silicon: bool) -> MslVersion {\n"
+            "    // iOS：按 iOS 运行时版本选择（A 系列 GPU 上 MSL 3.x 均受支持）。\n"
+            "    #[cfg(target_os = \"ios\")]\n"
+            "    {\n"
+            "        let _ = is_apple_silicon;\n"
+            "        return if objc2::available!(ios = 18.0, ..) {\n"
+            "            MslVersion::V3_2\n"
+            "        } else if objc2::available!(ios = 17.0, ..) {\n"
+            "            MslVersion::V3_1\n"
+            "        } else if objc2::available!(ios = 16.0, ..) {\n"
+            "            MslVersion::V3_0\n"
+            "        } else if objc2::available!(ios = 15.0, ..) {\n"
+            "            MslVersion::V2_4\n"
+            "        } else {\n"
+            "            MslVersion::V2_3\n"
+            "        };\n"
+            "    }\n"
+            "    #[cfg(not(target_os = \"ios\"))]\n"
+            "    select_msl_language_version_macos(is_apple_silicon)\n"
+            "}\n"
+            "\n"
+            "#[cfg(not(target_os = \"ios\"))]\n"
+            "fn select_msl_language_version_macos(is_apple_silicon: bool) -> MslVersion {",
+            "MSL 版本按平台选择（iOS 分支）",
+        ),
+    ],
+)
+
+edit(
+    "src/video_core/src/renderer_metal/metal_shader.rs",
+    [
+        (
+            "    if objc2::available!(macos = 15.0, ..) {\n"
+            "        compile_options.setMathMode(MTLMathMode::Safe);",
+            "    if objc2::available!(macos = 15.0, ios = 18.0, ..) {\n"
+            "        compile_options.setMathMode(MTLMathMode::Safe);",
+            "mathMode 门控加 ios 版本条件",
+        ),
+    ],
+)
+
+edit(
+    "src/video_core/src/renderer_metal/metal_vertex_pulling.rs",
+    [
+        (
+            "            if objc2::available!(macos = 15.0, ..) {\n"
+            "                options.setMathMode(MTLMathMode::Safe);",
+            "            if objc2::available!(macos = 15.0, ios = 18.0, ..) {\n"
+            "                options.setMathMode(MTLMathMode::Safe);",
+            "vertex pulling 的 mathMode 门控加 ios 条件",
+        ),
+    ],
+)
+
 # ---------------------------------------------------------------------------
 print()
 print(f"=== 补丁完成：{changed} 个文件被修改 ===")
