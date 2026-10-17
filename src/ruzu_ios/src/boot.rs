@@ -59,6 +59,8 @@ pub fn boot(
     scale: f32,
 ) -> Result<BootSession, String> {
     crate::log_line(&format!("=== boot 开始：{path} ==="));
+    unsafe { crate::ruzu_install_crash_handler(); }
+    crate::log_line("boot: 崩溃记录器已安装");
 
     // ---------------------------------------------------------------- 渲染后端
     // iOS 只有 Metal 这一条原生路径（Vulkan 需要 MoltenVK，OpenGL 已废弃）。
@@ -105,12 +107,15 @@ pub fn boot(
 
         // --- GPU + Metal 渲染器 ---
         let system_ref = SystemRef::from_ref(&*system);
+        crate::log_line("boot(factory): 即将 create_gpu");
         let gpu = video_core::video_core::create_gpu(system_ref, |backend, gpu| {
             let frame_displayed_notify: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
             let frame_end_notify: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
 
             let renderer: Box<dyn RendererBase> = match backend {
-                common::settings_enums::RendererBackend::Metal => Box::new(
+                common::settings_enums::RendererBackend::Metal => {
+                    crate::log_line("boot(factory): 即将 RendererMetal::new");
+                    Box::new(
                     video_core::renderer_metal::renderer_metal::RendererMetal::new(
                         &info_for_factory,
                         Arc::clone(&shown_for_factory),
@@ -122,7 +127,8 @@ pub fn boot(
                         Some(unsafe { gpu.shader_notify_handle() }),
                     )
                     .map_err(|error| format!("Metal 渲染器创建失败：{error}"))?,
-                ),
+                    )
+                }
                 other => {
                     return Err(format!("iOS 只支持 Metal 渲染器（当前后端：{other:?}）"));
                 }
