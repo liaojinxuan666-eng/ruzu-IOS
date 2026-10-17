@@ -250,6 +250,7 @@ fn probe_exclusive_monitor(out: &mut String) {
         // **数据绝对不能放在代码页里**：写完代码后整页是 R-X（只读），
         // 往里面写会立刻 SIGBUS —— 2026-10-17 真机就是崩在这一行。
         // 用栈上的变量当计数器即可（独占监视器对任何地址都有效）。
+        let rmw: extern "C" fn(*mut u32) -> u32 = std::mem::transmute(page);
         let mut local_counter: u32 = 0;
         let counter: *mut u32 = &mut local_counter;
 
