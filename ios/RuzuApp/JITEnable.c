@@ -203,8 +203,11 @@ int ruzu_try_self_trace(char *why, size_t why_len) {
 #include <string.h>
 #include <sys/ucontext.h>
 
-// Rust 侧提供的写日志函数
-extern void ruzu_log_line(const char *msg);
+// Rust 侧提供的日志 fd（预打开、O_APPEND）。
+// **关键**：信号处理器里不能加锁、不能 malloc —— 之前调用 Rust 的 log_line
+// 会去抢 Mutex，崩溃时若有别的线程正持锁就死锁，进程被 watchdog 杀掉，
+// 连 [CRASH] 都写不出来。改成直接 write(2) 到预打开的 fd（async-signal-safe）。
+extern int ruzu_log_fd(void);
 
 static void ruzu_crash_handler(int sig, siginfo_t *info, void *uap) {
     char buf[512];
@@ -218,10 +221,16 @@ static void ruzu_crash_handler(int sig, siginfo_t *info, void *uap) {
         lr = (uintptr_t)uc->uc_mcontext->__ss.__lr;
     }
 #endif
-    snprintf(buf, sizeof(buf),
-             "[CRASH] signal=%d addr=0x%lx pc=0x%lx lr=0x%lx", sig,
-             (unsigned long)far, (unsigned long)pc, (unsigned long)lr);
-    ruzu_log_line(buf);
+    int n = snprintf(buf, sizeof(buf),
+                     "[CRASH] signal=%d addr=0x%lx pc=0x%lx lr=0x%lx\n", sig,
+                     (unsigned long)far, (unsigned long)pc, (unsigned long)lr);
+    if (n > 0) {
+        int fd = ruzu_log_fd();
+        if (fd >= 0) {
+            ssize_t ignored = write(fd, buf, (size_t)n);
+            (void)ignored;
+        }
+    }
 
     // 恢复默认处理再抛一次：让系统生成正常的崩溃报告
     signal(sig, SIG_DFL);
@@ -237,4 +246,6 @@ void ruzu_install_crash_handler(void) {
     sigaction(SIGBUS, &sa, NULL);
     sigaction(SIGILL, &sa, NULL);
     sigaction(SIGFPE, &sa, NULL);
+    // SIGABRT：另一个线程 panic → abort，catch_unwind 管不到
+    sigaction(SIGABRT, &sa, NULL);
 }
