@@ -335,6 +335,11 @@ const SIGSEGV: c_int = 11;
 const SIGBUS: c_int = 10;
 const SIGUSR1: c_int = 30;
 
+/// 信号计数器。用原子类型：`static mut` + 裸读写会被优化器缓存，
+/// 导致"处理器明明跑了、主线程读到的还是旧值"（这是 ④-c 一直读 0 的可疑原因之一）。
+static CAUGHT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static USR1_HITS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
 #[repr(C)]
 struct SigAction {
     handler: usize,
@@ -342,25 +347,20 @@ struct SigAction {
     flags: c_int,
 }
 
-static mut CAUGHT: c_int = 0;
-static mut USR1_HITS: c_int = 0;
-
 extern "C" {
     fn sigaction(sig: c_int, act: *const SigAction, old: *mut SigAction) -> c_int;
     fn raise(sig: c_int) -> c_int;
+    fn sigpending(set: *mut libc::sigset_t) -> c_int;
+    fn sigismember(set: *const libc::sigset_t, sig: c_int) -> c_int;
 }
 
 extern "C" fn segv_handler(_sig: c_int) {
     // 只计数，**绝不 longjmp** —— 见下面 probe_signal_recovery 的说明。
-    unsafe {
-        CAUGHT += 1;
-    }
+    CAUGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
 extern "C" fn usr1_handler(_sig: c_int) {
-    unsafe {
-        USR1_HITS += 1;
-    }
+    USR1_HITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// ④ 信号机制可用性。
@@ -378,6 +378,34 @@ extern "C" fn usr1_handler(_sig: c_int) {
 /// 「从硬件异常恢复」留到真正写 NCE 时，配 sigaltstack + sigsetjmp 一起做。
 fn probe_signal_recovery(out: &mut String) {
     unsafe {
+        // ⓿ 本线程的信号屏蔽集 —— 这是 NCE 能不能工作的前提。
+        //    libdispatch 的工作线程默认把大多数信号屏蔽了（真机实测），
+        //    不管它的话，NCE 靠信号拦截 SVC / 访存异常的机制根本收不到。
+        let mut old: libc::sigset_t = std::mem::zeroed();
+        libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut old);
+        let blocked = |s: c_int| libc::sigismember(&old, s) == 1;
+        writeln!(
+            out,
+            "     进入时屏蔽状态：SIGSEGV={} SIGBUS={} SIGILL={} SIGUSR1={}",
+            if blocked(SIGSEGV) { "屏蔽" } else { "可用" },
+            if blocked(SIGBUS) { "屏蔽" } else { "可用" },
+            if blocked(libc::SIGILL) { "屏蔽" } else { "可用" },
+            if blocked(SIGUSR1) { "屏蔽" } else { "可用" },
+        )
+        .unwrap();
+
+        let mut want: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut want);
+        libc::sigaddset(&mut want, SIGSEGV);
+        libc::sigaddset(&mut want, SIGBUS);
+        libc::sigaddset(&mut want, libc::SIGILL);
+        libc::sigaddset(&mut want, SIGUSR1);
+        if libc::pthread_sigmask(libc::SIG_UNBLOCK, &want, std::ptr::null_mut()) == 0 {
+            writeln!(out, "     已解除 SIGSEGV/SIGBUS/SIGILL/SIGUSR1 屏蔽（NCE 拦截异常的前提）").unwrap();
+        } else {
+            writeln!(out, "     [警告] 解除信号屏蔽失败 errno={}", *libc::__error()).unwrap();
+        }
+
         // ① 注册 SIGSEGV / SIGBUS 处理器
         let act = SigAction {
             handler: segv_handler as *const () as usize,
@@ -455,17 +483,25 @@ fn probe_signal_recovery(out: &mut String) {
             let mut ok_rounds = 0;
             let mut detail = String::new();
             for round in 1..=3 {
-                // 注意：USR1_HITS 是 static，**不能**直接用 `== 1` 判成功 ——
-                // 第二次跑这个按钮时它会累计成 2（这也是之前误判的原因之一）。
-                // 正确做法是看本次增量。
-                let before = USR1_HITS;
+                // 注意：USR1_HITS 是原子计数器，用增量判断（累计值会被多次运行污染）。
+                let before = USR1_HITS.load(std::sync::atomic::Ordering::SeqCst);
                 raise(SIGUSR1);
-                let hits = USR1_HITS - before;
+                let hits = USR1_HITS.load(std::sync::atomic::Ordering::SeqCst) - before;
+                // 区分两种失败：信号被屏蔽（变成 pending） vs 投递了但没计数
+                let mut pend: libc::sigset_t = std::mem::zeroed();
+                sigpending(&mut pend);
+                let pending = sigismember(&pend, SIGUSR1) == 1;
                 if hits == 1 {
                     ok_rounds += 1;
                 }
-                writeln!(detail, "     第 {round}/3 轮：本次命中 {hits} 次{}", if hits == 1 { " ✓" } else { " ✗" }).unwrap();
-                crate::log_line(&format!("NCE④-c 第 {round}/3 轮：hits={hits}"));
+                writeln!(
+                    detail,
+                    "     第 {round}/3 轮：本次命中 {hits} 次{}（{}）",
+                    if hits == 1 { " ✓" } else { " ✗" },
+                    if pending { "信号处于待决 → 仍被屏蔽" } else { "信号未待决" }
+                )
+                .unwrap();
+                crate::log_line(&format!("NCE④-c 第 {round}/3 轮：hits={hits} pending={pending}"));
             }
             if ok_rounds == 3 {
                 writeln!(out, "[OK]   ④-c 解除屏蔽后信号送达处理器（3 轮全部命中 1 次）：").unwrap();

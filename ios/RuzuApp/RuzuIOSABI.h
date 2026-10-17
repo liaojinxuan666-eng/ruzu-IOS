@@ -35,6 +35,12 @@ void ruzu_ios_set_log_path(const char *path);
 /// 读出探测日志内容。
 char *ruzu_ios_read_log(void);
 
+/// 窗口接入自检：用 CAMetalLayer* 构造 iOS 的 EmuWindow 并回报窗口信息。
+char *ruzu_ios_window_probe(void *layer, uint32_t width, uint32_t height, float scale);
+
+/// core 链接探针（默认 feature 关闭时返回未接入）。
+char *ruzu_ios_core_link_probe(void);
+
 /// 释放上面几个函数返回的字符串。
 void ruzu_ios_free_string(char *s);
 

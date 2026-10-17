@@ -64,7 +64,11 @@ final class ViewController: UIViewController {
         logButton.setTitle("⑥ 查看探测日志", for: .normal)
         logButton.addTarget(self, action: #selector(showProbeLog), for: .touchUpInside)
 
-        let buttons = UIStackView(arrangedSubviews: [safe, metal, unsigned, nce, selfTrace, logButton])
+        let windowProbe = UIButton(type: .system)
+        windowProbe.setTitle("⑦ 窗口接入自检（Metal + core）", for: .normal)
+        windowProbe.addTarget(self, action: #selector(runWindowProbe), for: .touchUpInside)
+
+        let buttons = UIStackView(arrangedSubviews: [safe, metal, unsigned, nce, selfTrace, logButton, windowProbe])
         buttons.axis = .vertical
         buttons.spacing = 8
 
@@ -132,6 +136,24 @@ final class ViewController: UIViewController {
     @objc private func showProbeLog() {
         reset("探测日志")
         append(RuzuFFI.log)
+    }
+
+    /// 把预览视图的 CAMetalLayer 交给 Rust 侧的 EmuWindow，
+    /// 验证「Swift → core → video_core」这条数据通路。
+    @objc private func runWindowProbe() {
+        reset("窗口接入自检")
+        previewView.isHidden = false
+        view.layoutIfNeeded()
+        guard previewView.bounds.width > 0 else {
+            append("[FAIL] 预览视图还没有尺寸")
+            return
+        }
+        let scale = Float(UIScreen.main.scale)
+        let layer = previewView.metalLayer
+        let ptr = Unmanaged.passUnretained(layer).toOpaque()
+        let w = UInt32(previewView.bounds.width * CGFloat(scale))
+        let h = UInt32(previewView.bounds.height * CGFloat(scale))
+        append(RuzuFFI.windowProbe(layer: ptr, width: w, height: h, scale: scale))
     }
 
     @objc private func runNCEPrecheck() {

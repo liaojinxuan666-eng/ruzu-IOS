@@ -21,6 +21,8 @@ use std::ffi::{c_char, c_int, c_void, CString};
 use std::fmt::Write as _;
 
 mod core_link;
+#[cfg(feature = "core")]
+mod emu_window_ios;
 mod jitmem;
 mod nce_probe;
 
@@ -693,6 +695,38 @@ fn core_status() -> String {
 #[no_mangle]
 pub extern "C" fn ruzu_ios_core_link_probe() -> *mut c_char {
     to_c_string(core_status())
+}
+
+/// 窗口接入自检：用 Swift 传来的 `CAMetalLayer*` 构造 iOS 的 EmuWindow，
+/// 并确认渲染后端能拿到的窗口信息（尺寸/缩放/layout/类型）都对。
+///
+/// **不启动模拟器**，只是把「Swift ↔ core ↔ video_core」这条数据通路打通并验证。
+#[no_mangle]
+pub extern "C" fn ruzu_ios_window_probe(
+    layer: *mut c_void,
+    width: u32,
+    height: u32,
+    scale: f32,
+) -> *mut c_char {
+    #[cfg(feature = "core")]
+    {
+        let mut win = emu_window_ios::EmuWindowIos::new(layer, width, height, scale);
+        let mut s = win.describe();
+        // 顺便验证 resize 路径
+        win.on_resize(width, height, scale);
+        s.push_str(&format!(
+            "\n· resize 后客户区 = {}×{}\n· is_shown() = {}（EmuWindow trait 已实现）",
+            win.base().client_area_width,
+            win.base().client_area_height,
+            ruzu_core::frontend::emu_window::EmuWindow::is_shown(&win),
+        ));
+        to_c_string(s)
+    }
+    #[cfg(not(feature = "core"))]
+    {
+        let _ = (layer, width, height, scale);
+        to_c_string("core 未接入（feature `core` 关闭），窗口自检跳过".to_string())
+    }
 }
 
 #[no_mangle]

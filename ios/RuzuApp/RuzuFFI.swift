@@ -38,4 +38,12 @@ enum RuzuFFI {
         let path = dir.appendingPathComponent("nce_probe.log").path
         path.withCString { ruzu_ios_set_log_path($0) }
     }
+
+    /// 窗口接入自检：把 CAMetalLayer 指针交给 Rust 侧的 EmuWindow。
+    static func windowProbe(layer: UnsafeMutableRawPointer,
+                            width: UInt32, height: UInt32, scale: Float) -> String {
+        take(ruzu_ios_window_probe(layer, width, height, scale))
+    }
+
+    static var coreLinkProbe: String { take(ruzu_ios_core_link_probe()) }
 }
