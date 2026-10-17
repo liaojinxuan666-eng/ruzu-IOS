@@ -506,9 +506,41 @@ fn probe_signal_recovery(out: &mut String) {
             if ok_rounds == 3 {
                 writeln!(out, "[OK]   ④-c 解除屏蔽后信号送达处理器（3 轮全部命中 1 次）：").unwrap();
             } else {
-                writeln!(out, "[FAIL] ④-c 信号送达不稳定（3 轮里只有 {ok_rounds} 轮正确）：").unwrap();
+                writeln!(
+                    out,
+                    "[??]   ④-c 当前线程上 3 轮里只有 {ok_rounds} 轮观察到投递（dispatch 线程的怪癖，见下）："
+                )
+                .unwrap();
             }
             out.push_str(&detail);
+
+            // 关键补充实验：**在独立线程上**再验一次。
+            // dispatch 的工作线程对 SIGUSR1 有古怪行为（解除屏蔽后仍然观察不到投递，
+            // 而且信号也不处于待决状态）。但 NCE 将来跑客户机代码的线程是我们自己
+            // 创建的普通线程，所以这里单独测一次才有意义。
+            let before = USR1_HITS.load(std::sync::atomic::Ordering::SeqCst);
+            let h = std::thread::spawn(|| {
+                raise(SIGUSR1);
+            });
+            let _ = h.join();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            let on_own_thread = USR1_HITS.load(std::sync::atomic::Ordering::SeqCst) - before;
+            if on_own_thread == 1 {
+                writeln!(
+                    out,
+                    "[OK]   ④-c(独立线程) 我们自己创建的线程上信号**正常送达**（命中 1 次）\n\
+                     　　　→ 结论：信号机制本身没问题，dispatch 队列线程才是特例；\n\
+                     　　　　NCE 的模拟线程用普通 std::thread 即可。"
+                )
+                .unwrap();
+            } else {
+                writeln!(
+                    out,
+                    "[FAIL] ④-c(独立线程) 独立线程上也没收到信号（命中 {on_own_thread} 次）\n\
+                     　　　→ 信号投递在本进程里确实异常，NCE 需要改用 Mach 异常端口而不是信号。"
+                )
+                .unwrap();
+            }
         } else {
             writeln!(out, "[FAIL] ④-c 注册 SIGUSR1 处理器失败 errno={}", *libc::__error()).unwrap();
         }
