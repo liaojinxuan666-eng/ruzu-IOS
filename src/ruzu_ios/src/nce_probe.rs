@@ -431,11 +431,33 @@ fn probe_signal_recovery(out: &mut String) {
             flags: 0,
         };
         if sigaction(SIGUSR1, &act2, std::ptr::null_mut()) == 0 {
+            // **关键**：dispatch 队列的工作线程通常把大多数信号**屏蔽**了。
+            // 屏蔽状态下 raise() 只会把信号变成"待决（pending）"，处理器不会立刻跑，
+            // 于是它会在某个不确定的时机、在别的线程上才落地 ——
+            // 这正是之前几轮测试"时好时坏 / 命中 0 次"的根因。
+            //
+            // 顺带一个重要结论（对 NCE 直接相关）：**跑客户机代码的线程必须解除
+            // 信号屏蔽**，否则 SVC / 访存异常的拦截根本收不到。
+            let unblocked = {
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, SIGUSR1);
+                libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut()) == 0
+            };
+            if unblocked {
+                writeln!(out, "     已在本线程解除 SIGUSR1 屏蔽（原先被 dispatch 屏蔽了）").unwrap();
+            } else {
+                writeln!(out, "     [警告] 解除 SIGUSR1 屏蔽失败 errno={}", *libc::__error()).unwrap();
+            }
+            // 给可能残留的待决信号一点落地时间，避免干扰下面的逐轮增量统计
+            std::thread::sleep(std::time::Duration::from_millis(50));
+
             let mut ok_rounds = 0;
             let mut detail = String::new();
             for round in 1..=3 {
                 // 注意：USR1_HITS 是 static，**不能**直接用 `== 1` 判成功 ——
-                // 第二次跑这个按钮时它会累计成 2（这就是之前"时好时坏"的根因）。
+                // 第二次跑这个按钮时它会累计成 2（这也是之前误判的原因之一）。
+                // 正确做法是看本次增量。
                 let before = USR1_HITS;
                 raise(SIGUSR1);
                 let hits = USR1_HITS - before;
@@ -446,7 +468,7 @@ fn probe_signal_recovery(out: &mut String) {
                 crate::log_line(&format!("NCE④-c 第 {round}/3 轮：hits={hits}"));
             }
             if ok_rounds == 3 {
-                writeln!(out, "[OK]   ④-c 信号送达处理器（3 轮全部命中 1 次）：").unwrap();
+                writeln!(out, "[OK]   ④-c 解除屏蔽后信号送达处理器（3 轮全部命中 1 次）：").unwrap();
             } else {
                 writeln!(out, "[FAIL] ④-c 信号送达不稳定（3 轮里只有 {ok_rounds} 轮正确）：").unwrap();
             }
