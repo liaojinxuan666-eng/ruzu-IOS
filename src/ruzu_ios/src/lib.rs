@@ -273,6 +273,37 @@ pub extern "C" fn ruzu_ios_set_log_path(path: *const c_char) {
     if let Ok(mut g) = LOG_PATH.lock() {
         *g = Some(std::path::PathBuf::from(p));
     }
+    // 路径就绪后立刻接管 log，保证核心的早期日志也能写进来
+    install_logger();
+}
+
+/// 把 ruzu 核心内部的 `log` 输出接到探测日志文件。
+///
+/// 没有它的时候，核心只会往 stderr 打 warn/error（iOS 上看不到），
+/// 我们只能看到 panic —— 有了它，像"fiber stack 分配了多少"、
+/// "GPU 初始化卡在哪"这类信息都能落到 Documents/nce_probe.log。
+struct ProbeFileLogger;
+
+impl log::Log for ProbeFileLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::Level::Info
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            log_line(&format!("[{}] {}", record.level(), record.args()));
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+fn install_logger() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = log::set_logger(&ProbeFileLogger);
+        log::set_max_level(log::LevelFilter::Info);
+    });
 }
 
 /// 追加一行到探测日志（没有配置路径、或写失败时静默忽略）。
