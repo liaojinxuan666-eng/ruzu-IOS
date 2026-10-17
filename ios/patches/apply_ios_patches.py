@@ -928,6 +928,56 @@ edit(
     ],
 )
 
+
+# ---------------------------------------------------------------------------
+# 10. renderer_metal：iOS 上不能用 macOS 专有的 MTLDevice selector
+# ---------------------------------------------------------------------------
+# 真机实测（iPhone11,6 / iOS 18.5）：在 MetalDevice::new() 里 SIGABRT，
+# 原因是能力查询里用 `objc2::available!(macos = 14.0, ..)` 判断能不能调
+# `device.architecture()` —— 而 iOS 上 `available!` 会拿 **iOS 的版本号** 跟
+# 14.0 比（18.5 ≥ 14.0 → true），于是真的去调了一个 macOS 专有 selector，
+# 抛 unrecognized selector → NSInvalidArgumentException → abort。
+#
+# 修法：这类判断必须先判平台再判版本。
+edit(
+    "src/video_core/src/renderer_metal/metal_device.rs",
+    [
+        (
+            "        let supports_metal3_family =\n"
+            "            objc2::available!(macos = 13.0, ..) && device.supportsFamily(MTLGPUFamily::Metal3);",
+            "        let supports_metal3_family = cfg!(target_os = \"macos\")\n"
+            "            && objc2::available!(macos = 13.0, ..)\n"
+            "            && device.supportsFamily(MTLGPUFamily::Metal3);",
+            "Metal3 family 判定加平台限制",
+        ),
+        (
+            "        let supports_metal4_family =\n"
+            "            objc2::available!(macos = 26.0, ..) && device.supportsFamily(MTLGPUFamily::Metal4);",
+            "        let supports_metal4_family = cfg!(target_os = \"macos\")\n"
+            "            && objc2::available!(macos = 26.0, ..)\n"
+            "            && device.supportsFamily(MTLGPUFamily::Metal4);",
+            "Metal4 family 判定加平台限制",
+        ),
+        (
+            "            architecture_name: if objc2::available!(macos = 14.0, ..) {\n"
+            "                device.architecture().name().to_string()\n"
+            "            } else {\n"
+            "                device.name().to_string()\n"
+            "            },",
+            "            // `MTLDevice.architecture()` 是 macOS 14+ 专有；iOS 上调用会\n"
+            "            // 抛 unrecognized selector 直接 abort（真机踩过）。\n"
+            "            architecture_name: if cfg!(target_os = \"macos\")\n"
+            "                && objc2::available!(macos = 14.0, ..)\n"
+            "            {\n"
+            "                device.architecture().name().to_string()\n"
+            "            } else {\n"
+            "                device.name().to_string()\n"
+            "            },",
+            "architecture() 只在 macOS 上调用",
+        ),
+    ],
+)
+
 # ---------------------------------------------------------------------------
 print()
 print(f"=== 补丁完成：{changed} 个文件被修改 ===")
