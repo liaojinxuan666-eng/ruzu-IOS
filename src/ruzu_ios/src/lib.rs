@@ -780,12 +780,22 @@ pub extern "C" fn ruzu_ios_boot(
         let p = unsafe { std::ffi::CStr::from_ptr(path) }
             .to_string_lossy()
             .into_owned();
-        match boot::boot(&p, layer, width, height, scale) {
-            Ok(session) => to_c_string(session.message),
-            Err(e) => {
+        // 用 catch_unwind 兜住 panic：模拟器里大量地方用 expect()，
+        // 一旦 panic 就 abort 会直接闪退，界面什么也看不到。
+        // 兜住之后错误会显示在界面上（同时已写进探测日志）。
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            boot::boot(&p, layer, width, height, scale)
+        }));
+        match outcome {
+            Ok(Ok(session)) => to_c_string(session.message),
+            Ok(Err(e)) => {
                 log_line(&format!("boot 失败：{e}"));
                 to_c_string(format!("启动失败：{e}\n\n详细步骤见「⑥ 查看探测日志」"))
             }
+            Err(_) => to_c_string(
+                "启动过程中发生了 panic（不会闪退了）\n\n                 具体信息在「⑥ 查看探测日志」里，形如 `[PANIC] ...`，把它发我即可定位"
+                    .to_string(),
+            ),
         }
     }
     #[cfg(not(feature = "core"))]
