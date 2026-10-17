@@ -1341,6 +1341,37 @@ edit(
     ],
 )
 
+# ---------------------------------------------------------------------------
+# 17. renderer_metal：sampler 的 lodBias / reductionMode 按系统可用性门控
+# ---------------------------------------------------------------------------
+# 查 Apple 官方文档（tutorials/data/documentation JSON）确认：
+#   MTLSamplerDescriptor.lodBias        → iOS 26.0+ / macOS 26.0+
+#   MTLSamplerDescriptor.reductionMode  → iOS 26.0+ / macOS 26.0+
+# 而 borderColor 是 iOS 14+、normalizedCoordinates 是 iOS 8+，都没问题。
+# 在 iOS 18.5 上调那两个 setter 会 unrecognized selector → ObjC 异常 → abort
+# （真机日志：崩在 MetalTextureCache::new 里的 MetalSampler::new）。
+# 修法：按可用性门控（**通用**，对所有设备一致），老系统上退化为默认采样语义。
+edit(
+    "src/video_core/src/renderer_metal/metal_sampler.rs",
+    [
+        (
+            "            descriptor.setBorderColor(native_border_color);\n"
+            "            descriptor.setReductionMode(reduction);\n"
+            "            descriptor.setLodBias(tsc.lod_bias());",
+            "            descriptor.setBorderColor(native_border_color);\n"
+            "            // lodBias / reductionMode 是 iOS 26 / macOS 26 才新增的 API；\n"
+            "            // 在更老的系统上调用会 unrecognized selector -> abort（真机踩过）。\n"
+            "            if objc2::available!(ios = 26.0, macos = 26.0, ..) {\n"
+            "                descriptor.setReductionMode(reduction);\n"
+            "                descriptor.setLodBias(tsc.lod_bias());\n"
+            "            } else {\n"
+            "                let _ = reduction;\n"
+            "            }",
+            "lodBias / reductionMode 按可用性门控",
+        ),
+    ],
+)
+
 sanity_check()
 
 print()
