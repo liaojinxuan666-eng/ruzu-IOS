@@ -1262,6 +1262,85 @@ def sanity_check():
         print("\n✅ 自检通过（SANITY: 裸 qf! 检查）")
 
 
+# ---------------------------------------------------------------------------
+# 16. renderer_metal：MetalRasterizer::new 的 14 个子模块检查点
+# ---------------------------------------------------------------------------
+edit(
+    "src/video_core/src/renderer_metal/metal_rasterizer.rs",
+    [
+        (
+            '        let mut scheduler = Box::new(MetalScheduler::new(&device));',
+            '        log::info!("[metal] rasterizer 1/14 scheduler");\n        let mut scheduler = Box::new(MetalScheduler::new(&device));',
+            "rasterizer 检查点 1/14 scheduler",
+        ),
+        (
+            '        let mut staging_pool = Box::new(MetalStagingBufferPool::new(&device)?);',
+            '        log::info!("[metal] rasterizer 2/14 staging pool");\n        let mut staging_pool = Box::new(MetalStagingBufferPool::new(&device)?);',
+            "rasterizer 检查点 2/14 staging pool",
+        ),
+        (
+            '        let buffer_runtime =',
+            '        log::info!("[metal] rasterizer 3/14 buffer runtime");\n        let buffer_runtime =',
+            "rasterizer 检查点 3/14 buffer runtime",
+        ),
+        (
+            '        let mut common_buffer_cache = Box::new(MetalCommonBufferCache::new(',
+            '        log::info!("[metal] rasterizer 4/14 common buffer cache");\n        let mut common_buffer_cache = Box::new(MetalCommonBufferCache::new(',
+            "rasterizer 检查点 4/14 common buffer cache",
+        ),
+        (
+            '        let mut blit_image = Box::new(MetalBlitHelper::new(&device)?);',
+            '        log::info!("[metal] rasterizer 5/14 blit helper");\n        let mut blit_image = Box::new(MetalBlitHelper::new(&device)?);',
+            "rasterizer 检查点 5/14 blit helper",
+        ),
+        (
+            '        let texture_cache = Box::new(MetalTextureCache::new(',
+            '        log::info!("[metal] rasterizer 6/14 texture cache");\n        let texture_cache = Box::new(MetalTextureCache::new(',
+            "rasterizer 检查点 6/14 texture cache",
+        ),
+        (
+            '        let shader_cache = ShaderCache::new(device_memory);',
+            '        log::info!("[metal] rasterizer 7/14 shader cache");\n        let shader_cache = ShaderCache::new(device_memory);',
+            "rasterizer 检查点 7/14 shader cache",
+        ),
+        (
+            '        let pipeline_cache = MetalPipelineCache::new(device.clone());',
+            '        log::info!("[metal] rasterizer 8/14 pipeline cache");\n        let pipeline_cache = MetalPipelineCache::new(device.clone());',
+            "rasterizer 检查点 8/14 pipeline cache",
+        ),
+        (
+            '        let query_cache = MetalQueryCache::new(&device)?;',
+            '        log::info!("[metal] rasterizer 9/14 query cache");\n        let query_cache = MetalQueryCache::new(&device)?;',
+            "rasterizer 检查点 9/14 query cache",
+        ),
+        (
+            '        let query_cache_runtime = unsafe {',
+            '        log::info!("[metal] rasterizer 10/14 query cache runtime");\n        let query_cache_runtime = unsafe {',
+            "rasterizer 检查点 10/14 query cache runtime",
+        ),
+        (
+            '        let conditional_arguments_pass = ConditionalRenderingArgumentsPass::new(&device)?;',
+            '        log::info!("[metal] rasterizer 11/14 conditional arguments");\n        let conditional_arguments_pass = ConditionalRenderingArgumentsPass::new(&device)?;',
+            "rasterizer 检查点 11/14 conditional arguments",
+        ),
+        (
+            '        let state_tracker = MetalStateTracker::new();',
+            '        log::info!("[metal] rasterizer 12/14 state tracker");\n        let state_tracker = MetalStateTracker::new();',
+            "rasterizer 检查点 12/14 state tracker",
+        ),
+        (
+            '        let fence_manager = MetalFenceManager::new(false);',
+            '        log::info!("[metal] rasterizer 13/14 fence manager");\n        let fence_manager = MetalFenceManager::new(false);',
+            "rasterizer 检查点 13/14 fence manager",
+        ),
+        (
+            '        let accelerate_dma = AccelerateDMA::new(common_buffer_cache.as_mut());',
+            '        log::info!("[metal] rasterizer 14/14 accelerate dma");\n        let accelerate_dma = AccelerateDMA::new(common_buffer_cache.as_mut());',
+            "rasterizer 检查点 14/14 accelerate dma",
+        ),
+    ],
+)
+
 sanity_check()
 
 print()
