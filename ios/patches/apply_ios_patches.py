@@ -846,6 +846,60 @@ else:
         problems.append("src/video_core/build.rs: 未找到 FFmpeg 探测块")
 
 # ---------------------------------------------------------------------------
+# 8. common/fiber.rs：iOS 上按 RLIMIT_STACK 做阶梯式栈分配
+# ---------------------------------------------------------------------------
+# `context` crate 的 ProtectedFixedSizeStack 会把请求大小和 RLIMIT_STACK 比较，
+# iOS 的 rlimit 是 999424 字节（约 976 KiB），而 DEFAULT_STACK_SIZE 是 4 MiB
+# → Err(ExceedsMaximumSize) → panic "failed to allocate fiber stack"。
+# iOS 上没法提 rlimit，所以按上限递减地试，取第一个能成的。
+edit(
+    "src/common/src/fiber.rs",
+    [
+        (
+            '        let stack =\n'
+            '            FixedSizeStack::new(DEFAULT_STACK_SIZE).expect("failed to allocate fiber stack");\n'
+            '        let rewind_stack =\n'
+            '            FixedSizeStack::new(DEFAULT_STACK_SIZE).expect("failed to allocate rewind stack");',
+            '        let stack = allocate_stack();\n'
+            '        let rewind_stack = allocate_stack();',
+            "fiber 栈改用阶梯分配",
+        ),
+        (
+            'const DEFAULT_STACK_SIZE: usize = 4 * 1024 * 1024;',
+            'const DEFAULT_STACK_SIZE: usize = 4 * 1024 * 1024;\n'
+            '\n'
+            '/// 按「能拿到的最大可用栈」阶梯式分配。\n'
+            '///\n'
+            '/// iOS 的 RLIMIT_STACK 是 999424 字节（约 976 KiB），context crate 会拿请求大小\n'
+            '/// 和它比较 —— 4 MiB 直接 Err(ExceedsMaximumSize)。这里从 4 MiB 往下递减，\n'
+            '/// 取第一个成功的；桌面平台第一条就成，行为不变。\n'
+            'fn allocate_stack() -> FixedSizeStack {\n'
+            '    const CANDIDATES: [usize; 6] = [\n'
+            '        4 * 1024 * 1024,\n'
+            '        960 * 1024,\n'
+            '        512 * 1024,\n'
+            '        256 * 1024,\n'
+            '        128 * 1024,\n'
+            '        64 * 1024,\n'
+            '    ];\n'
+            '    let mut last = String::new();\n'
+            '    for size in CANDIDATES {\n'
+            '        match FixedSizeStack::new(size) {\n'
+            '            Ok(stack) => {\n'
+            '                log::info!("fiber stack: allocated {size} bytes");\n'
+            '                return stack;\n'
+            '            }\n'
+            '            Err(error) => last = format!("{error}"),\n'
+            '        }\n'
+            '    }\n'
+            '    panic!("failed to allocate fiber stack: {last}");\n'
+            '}',
+            "加入 allocate_stack 阶梯分配",
+        ),
+    ],
+)
+
+# ---------------------------------------------------------------------------
 print()
 print(f"=== 补丁完成：{changed} 个文件被修改 ===")
 if problems:
