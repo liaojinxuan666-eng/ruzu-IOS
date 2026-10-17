@@ -24,6 +24,33 @@ pub struct BootSession {
     pub message: String,
 }
 
+/// 加载结果（诊断用）。
+pub struct LoadOutcome {
+    pub ok: bool,
+    pub message: String,
+}
+
+/// 只加载、不启动（诊断用）：验证 loader / 文件访问 / 客户机内存预留。
+pub fn load_game(path: &str) -> LoadOutcome {
+    let mut system = System::new();
+    system.set_subsystem_factory(Box::new(|_system: &mut System| Ok(())));
+    let status = system.load(path);
+    if status != SystemResultStatus::Success {
+        return LoadOutcome {
+            ok: false,
+            message: format!("加载失败：{status:?}\n路径：{path}"),
+        };
+    }
+    LoadOutcome {
+        ok: true,
+        message: format!(
+            "加载成功 ✓（未启动渲染）\n· 程序 ID：0x{:016X}\n· 64 位：{}",
+            system.runtime_program_id(),
+            system.runtime_is_64bit()
+        ),
+    }
+}
+
 pub fn boot(
     path: &str,
     layer: *mut c_void,
@@ -35,9 +62,13 @@ pub fn boot(
 
     // ---------------------------------------------------------------- 渲染后端
     // iOS 只有 Metal 这一条原生路径（Vulkan 需要 MoltenVK，OpenGL 已废弃）。
-    common::settings::values()
-        .renderer_backend
-        .set_value(common::settings_enums::RendererBackend::Metal);
+    {
+        let mut values = common::settings::values_mut();
+        values
+            .renderer_backend
+            .set_value(common::settings_enums::RendererBackend::Metal);
+        values.use_disk_shader_cache.set_value(false);
+    }
     crate::log_line("boot: 渲染后端 = Metal");
 
     // ---------------------------------------------------------------- 窗口
