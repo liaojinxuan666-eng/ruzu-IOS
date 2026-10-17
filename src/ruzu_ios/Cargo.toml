@@ -16,13 +16,16 @@ crate-type = ["staticlib"]
 # 链接测试开关：把真正的模拟器核心（core）编进来。
 # **默认关闭**，这样即使核心在 iOS 上还编不过，IPA 也永远能产出来
 # （手机里始终有一个能自检的 App）。等整条链路打通再把默认值改成 ["core"]。
-core = ["dep:ruzu_core"]
+core = ["dep:ruzu_core", "dep:video_core", "dep:audio_core", "dep:common"]
 
 [dependencies]
 libc = "0.2"
 # 真正的模拟器核心（可选）。放在普通 [dependencies] 里而不是 target 表里：
 # 这个 crate 本来就只编 iOS，feature 默认关闭，所以不会牵连任何平台。
 ruzu_core = { package = "core", path = "../core", optional = true }
+video_core = { path = "../video_core", optional = true }
+audio_core = { path = "../audio_core", optional = true }
+common = { path = "../common", optional = true }
 
 [profile.dev]
 opt-level = 1

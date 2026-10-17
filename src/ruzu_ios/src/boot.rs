@@ -1,58 +1,150 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //!
-//! 启动流程（分阶段实现）。
+//! 真正开机：`System::new` → 子系统工厂（Host1x / GPU(Metal) / AudioCore）
+//! → `load` → `apply_settings` → `gpu.start` → `run`。
 //!
-//! ## 阶段划分（为什么不一上来就全做）
+//! 调用顺序与 `src/ruzu/src/boot.rs`（GTK 前端）和 `ruzu_cmd`（SDL3 前端）一致，
+//! 只是把窗口来源换成我们的 `EmuWindowIos`（CAMetalLayer）。
 //!
-//! 真正开机需要的子系统工厂（`SubsystemFactory`）要一次性建好
-//! Host1x / GPU（Metal 渲染器 + `EmuWindowIos`）/ AudioCore，还要挂上
-//! GPU 访存钩子。里面任何一个参数写错都会变成"跑起来黑屏"，很难定位。
-//!
-//! 所以拆成两阶段：
-//!   * **阶段 1（本文件）**：`System::new()` → 注册工厂 → `load(path)`。
-//!     验证文件访问、加载器（.nro/NSO）、客户机内存预留（8 GiB VA）、密钥路径。
-//!     不接渲染器，所以不会黑屏，结论是确定的"能/不能加载"。
-//!   * 阶段 2（下一步）：在工厂里创建 GPU（Metal）+ AudioCore，`gpu.start()` + `run()`。
-//!
-//! 参考实现：`ruzu_cmd/src/main.rs`（SDL3 前端），调用顺序与上游 yuzu_cmd 一致。
+//! 注意：这个模块在 `core` feature 后面。**它编不过不会影响 IPA 产出**
+//! （CI 会自动回退纯外壳），所以可以放心大胆地迭代。
 
-use ruzu_core::core::{System, SystemResultStatus};
+use std::ffi::c_void;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, RwLock};
 
-/// 加载结果。
-pub struct LoadOutcome {
-    pub ok: bool,
+use ruzu_core::core::{System, SystemRef, SystemResultStatus};
+use ruzu_core::frontend::framebuffer_layout::FramebufferLayout;
+use video_core::renderer_base::RendererBase;
+
+use crate::emu_window_ios::EmuWindowIos;
+
+/// 开机结果（成功时返回给界面的说明文字）。
+pub struct BootSession {
     pub message: String,
 }
 
-/// 阶段 1：只做加载，验证整条非渲染路径。
-pub fn load_game(path: &str) -> LoadOutcome {
+pub fn boot(
+    path: &str,
+    layer: *mut c_void,
+    width: u32,
+    height: u32,
+    scale: f32,
+) -> Result<BootSession, String> {
+    crate::log_line(&format!("=== boot 开始：{path} ==="));
+
+    // ---------------------------------------------------------------- 渲染后端
+    // iOS 只有 Metal 这一条原生路径（Vulkan 需要 MoltenVK，OpenGL 已废弃）。
+    common::settings::values()
+        .renderer_backend
+        .set_value(common::settings_enums::RendererBackend::Metal);
+    crate::log_line("boot: 渲染后端 = Metal");
+
+    // ---------------------------------------------------------------- 窗口
+    let win = EmuWindowIos::new(layer, width, height, scale);
+    let window_info = win.base().get_window_info().clone();
+    crate::log_line(&format!(
+        "boot: EmuWindow layer=0x{:x} {}x{} scale={}",
+        layer as usize, width, height, scale
+    ));
+
+    let window_shown = Arc::new(AtomicBool::new(true));
+    let framebuffer_layout = Arc::new(RwLock::new(FramebufferLayout::default()));
+
+    // ---------------------------------------------------------------- 系统
     let mut system = System::new();
 
-    // 子系统工厂：load() 内部会在 setup_for_application_process() 阶段回调它。
-    // 这一版**故意不建 GPU**（渲染器接线是阶段 2 的事），直接返回 Ok，
-    // 让 load() 把加载流程走完 —— 我们要的信息在返回值里。
-    system.set_subsystem_factory(Box::new(|_system: &mut System| Ok(())));
+    let shown_for_factory = Arc::clone(&window_shown);
+    let layout_for_factory = Arc::clone(&framebuffer_layout);
+    let info_for_factory = window_info.clone();
 
+    system.set_subsystem_factory(Box::new(move |system: &mut System| {
+        // --- Host1x / 同步点 / 设备内存 ---
+        let host1x =
+            video_core::host1x::host1x::Host1x::new_with_system(SystemRef::from_ref(system));
+        let syncpoints = host1x.syncpoint_manager().clone();
+        let device_memory = host1x.memory_manager().clone();
+        system.set_host1x_core(Box::new(host1x));
+        crate::log_line("boot(factory): Host1x 就绪");
+
+        // --- GPU + Metal 渲染器 ---
+        let system_ref = SystemRef::from_ref(&*system);
+        let gpu = video_core::video_core::create_gpu(system_ref, |backend, gpu| {
+            let frame_displayed_notify: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+            let frame_end_notify: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+
+            let renderer: Box<dyn RendererBase> = match backend {
+                common::settings_enums::RendererBackend::Metal => Box::new(
+                    video_core::renderer_metal::renderer_metal::RendererMetal::new(
+                        &info_for_factory,
+                        Arc::clone(&shown_for_factory),
+                        Arc::clone(&layout_for_factory),
+                        frame_displayed_notify,
+                        frame_end_notify,
+                        syncpoints.clone(),
+                        Arc::clone(&device_memory),
+                        Some(unsafe { gpu.shader_notify_handle() }),
+                    )
+                    .map_err(|error| format!("Metal 渲染器创建失败：{error}"))?,
+                ),
+                other => {
+                    return Err(format!("iOS 只支持 Metal 渲染器（当前后端：{other:?}）"));
+                }
+            };
+            Ok::<_, String>(renderer)
+        })?;
+        system.set_gpu_core(gpu);
+        crate::log_line("boot(factory): GPU + Metal 渲染器就绪");
+
+        // --- 音频 ---
+        let audio = audio_core::AudioCore::new(SystemRef::from_ref(&*system));
+        system.set_audio_core(Box::new(audio));
+        crate::log_line("boot(factory): AudioCore 就绪");
+
+        Ok(())
+    }));
+
+    // ---------------------------------------------------------------- 加载
+    crate::log_line("boot: 调用 system.load()");
     let status = system.load(path);
     if status != SystemResultStatus::Success {
-        return LoadOutcome {
-            ok: false,
-            message: format!("加载失败：{status:?}\n路径：{path}"),
-        };
+        return Err(format!("加载失败：{status:?}"));
     }
-
     let program_id = system.runtime_program_id();
     let is_64bit = system.runtime_is_64bit();
+    crate::log_line(&format!(
+        "boot: 加载成功 program_id=0x{program_id:016X} 64bit={is_64bit}"
+    ));
 
-    LoadOutcome {
-        ok: true,
-        message: format!(
-            "加载成功 ✓\n\
-             · 路径：{path}\n\
-             · 程序 ID：0x{program_id:016X}\n\
-             · 64 位进程：{is_64bit}\n\
-             · 客户机内存已按 iOS 的限制预留（VA 上限 16 GiB，jetsam 2.28 GiB）\n\
-             下一步（阶段 2）：在子系统工厂里创建 Metal 渲染器 + AudioCore，然后 gpu.start() / run()"
-        ),
+    system.apply_settings();
+
+    // ---------------------------------------------------------------- 启动 GPU
+    if let Some(gpu_any) = system.gpu_core() {
+        if let Some(gpu) = gpu_any.as_any().downcast_ref::<video_core::gpu::Gpu>() {
+            gpu.start();
+            crate::log_line("boot: gpu.start() 完成");
+        } else {
+            crate::log_line("boot: gpu_core 不是 video_core::Gpu，跳过 start()");
+        }
     }
+
+    // ---------------------------------------------------------------- 跑起来
+    system.run();
+    crate::log_line("boot: system.run() 完成 —— 模拟已开始");
+
+    // 模拟会话必须活到进程结束：不能在这里 drop。
+    std::mem::forget(system);
+
+    Ok(BootSession {
+        message: format!(
+            "已启动 ✓\n\
+             · 程序 ID：0x{program_id:016X}（{} 位）\n\
+             · 渲染器：Metal（原生，无 MoltenVK）\n\
+             · 窗口：CAMetalLayer @ 0x{:x}，{width}×{height} @{scale}x\n\
+             · 客户机内存：8 GiB VA 预留 / 按需提交\n\
+             现在应该开始出画面了。若黑屏请点「⑥ 查看探测日志」，里面记录了每一步。",
+            if is_64bit { 64 } else { 32 },
+            layer as usize
+        ),
+    })
 }

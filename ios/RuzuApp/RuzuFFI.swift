@@ -51,4 +51,10 @@ enum RuzuFFI {
     static func loadGame(path: String) -> String {
         path.withCString { take(ruzu_ios_load_game($0)) }
     }
+
+    /// 真正开机。
+    static func boot(path: String, layer: UnsafeMutableRawPointer,
+                     width: UInt32, height: UInt32, scale: Float) -> String {
+        path.withCString { take(ruzu_ios_boot($0, layer, width, height, scale)) }
+    }
 }

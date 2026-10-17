@@ -70,7 +70,7 @@ final class ViewController: UIViewController, UIDocumentPickerDelegate {
         windowProbe.addTarget(self, action: #selector(runWindowProbe), for: .touchUpInside)
 
         let loadButton = UIButton(type: .system)
-        loadButton.setTitle("⑧ 选择文件并加载（阶段 1）", for: .normal)
+        loadButton.setTitle("⑧ 选择文件并启动（Metal 开机）", for: .normal)
         loadButton.addTarget(self, action: #selector(pickAndLoadGame), for: .touchUpInside)
 
         let buttons = UIStackView(arrangedSubviews: [safe, metal, unsigned, nce, selfTrace, logButton, windowProbe, loadButton])
@@ -215,9 +215,17 @@ final class ViewController: UIViewController, UIDocumentPickerDelegate {
         do {
             try FileManager.default.copyItem(at: url, to: dst)
             append("已拷入沙盒：\(dst.lastPathComponent)")
-            append("开始加载（客户机内存预留 + 解析，可能要几秒）…")
+            append("开始启动（加载 → 建 Metal 渲染器 → 起 CPU 线程）…")
+            // 在主线程取好 layer 与尺寸，再交给后台线程开机
+            previewView.isHidden = false
+            view.layoutIfNeeded()
+            let scale = Float(UIScreen.main.scale)
+            let layerPtr = Unmanaged.passUnretained(previewView.metalLayer).toOpaque()
+            let w = UInt32(max(previewView.bounds.width, 1) * CGFloat(scale))
+            let h = UInt32(max(previewView.bounds.height, 1) * CGFloat(scale))
+            let path = dst.path
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                let result = RuzuFFI.loadGame(path: dst.path)
+                let result = RuzuFFI.boot(path: path, layer: layerPtr, width: w, height: h, scale: scale)
                 DispatchQueue.main.async { self?.append(result) }
             }
         } catch {

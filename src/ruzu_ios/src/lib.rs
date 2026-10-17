@@ -757,6 +757,44 @@ pub extern "C" fn ruzu_ios_load_game(path: *const c_char) -> *mut c_char {
     }
 }
 
+/// 真正开机：加载 + 启动（GPU/Metal + Audio + system.run）。
+///
+/// `layer` 是 Swift 侧 `CAMetalLayer*`；`scale` 是屏幕缩放（2.0/3.0）。
+#[no_mangle]
+pub extern "C" fn ruzu_ios_boot(
+    path: *const c_char,
+    layer: *mut c_void,
+    width: u32,
+    height: u32,
+    scale: f32,
+) -> *mut c_char {
+    #[cfg(feature = "core")]
+    {
+        // panic 只打到 stderr，崩溃后看不到 —— 挂个钩子把它写进探测日志。
+        std::panic::set_hook(Box::new(|info| {
+            crate::log_line(&format!("[PANIC] {info}"));
+        }));
+        if path.is_null() {
+            return to_c_string("路径为空".to_string());
+        }
+        let p = unsafe { std::ffi::CStr::from_ptr(path) }
+            .to_string_lossy()
+            .into_owned();
+        match boot::boot(&p, layer, width, height, scale) {
+            Ok(session) => to_c_string(session.message),
+            Err(e) => {
+                log_line(&format!("boot 失败：{e}"));
+                to_c_string(format!("启动失败：{e}\n\n详细步骤见「⑥ 查看探测日志」"))
+            }
+        }
+    }
+    #[cfg(not(feature = "core"))]
+    {
+        let _ = (path, layer, width, height, scale);
+        to_c_string("core 未接入（feature `core` 关闭），无法开机".to_string())
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn ruzu_ios_free_string(p: *mut c_char) {
     if !p.is_null() {
