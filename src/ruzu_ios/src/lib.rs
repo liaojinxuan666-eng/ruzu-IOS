@@ -59,6 +59,8 @@ extern "C" {
     fn ruzu_page_protection(addr: *mut c_void, len: usize) -> c_int;
     fn ruzu_prot_to_string(prot: c_int, out: *mut c_char, out_len: usize);
     fn ruzu_try_self_trace(why: *mut c_char, why_len: usize) -> c_int;
+    /// 安装硬错误崩溃记录器（SIGSEGV/SIGBUS/SIGILL/SIGFPE → 写日志后重抛）
+    fn ruzu_install_crash_handler();
 }
 
 /// 把权限位掩码转成 "RWX"/"R-X" 这样的人话。
@@ -316,6 +318,18 @@ pub(crate) fn log_line(msg: &str) {
             }
         }
     }
+}
+
+/// 给 C 代码用的日志入口（崩溃记录器会调用）。
+#[no_mangle]
+pub extern "C" fn ruzu_log_line(msg: *const c_char) {
+    if msg.is_null() {
+        return;
+    }
+    let text = unsafe { std::ffi::CStr::from_ptr(msg) }
+        .to_string_lossy()
+        .into_owned();
+    log_line(&text);
 }
 
 /// 把探测日志读出来给界面显示。
