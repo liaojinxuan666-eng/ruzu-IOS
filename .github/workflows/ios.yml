@@ -139,6 +139,7 @@ jobs:
           curl -sSL -o /tmp/opus.tgz "https://github.com/xiph/opus/archive/refs/tags/v${V}.tar.gz"
           tar xzf /tmp/opus.tgz -C /tmp
           cmake -S "/tmp/opus-${V}" -B /tmp/opus-build \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
             -DCMAKE_SYSTEM_NAME=iOS \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
@@ -148,7 +149,7 @@ jobs:
             -DOPUS_BUILD_PROGRAMS=OFF > /dev/null
           cmake --build /tmp/opus-build -j 4
           mkdir -p "$GITHUB_WORKSPACE/third_party/opus"
-          cp /tmp/opus-build/libopus.a "$GITHUB_WORKSPACE/third_party/opus/"
+          cp "$(find /tmp/opus-build -name 'libopus.a' | head -1)" "$GITHUB_WORKSPACE/third_party/opus/"
           ls -la "$GITHUB_WORKSPACE/third_party/opus/"
 
       - name: 生成 Ruzu.xcodeproj
