@@ -25,6 +25,24 @@ targets:
           - "Info.plist"
           - "RuzuApp.entitlements"
           - "RuzuApp-jailbreak.entitlements"
+    # 链接时需要的系统框架：Rust 静态库里 SDL3（CoreAudio 后端）、
+    # Metal 后端、OpenSSL 的符号都要靠这些框架解析。
+    dependencies:
+      - sdk: UIKit.framework
+      - sdk: Foundation.framework
+      - sdk: CoreFoundation.framework
+      - sdk: CoreGraphics.framework
+      - sdk: QuartzCore.framework
+      - sdk: Metal.framework
+      - sdk: MetalKit.framework
+      - sdk: AudioToolbox.framework
+      - sdk: CoreAudio.framework
+      - sdk: AVFoundation.framework
+      - sdk: GameController.framework
+      - sdk: Security.framework
+      - sdk: CoreMedia.framework
+      - sdk: CoreVideo.framework
+
     settings:
       base:
         PRODUCT_NAME: Ruzu
