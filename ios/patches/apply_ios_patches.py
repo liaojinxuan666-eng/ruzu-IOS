@@ -1111,6 +1111,125 @@ edit(
 )
 
 # ---------------------------------------------------------------------------
+# 14. renderer_metal：profile 每个字段查询都打日志（定位 macOS 专有 selector）
+# ---------------------------------------------------------------------------
+# 崩溃报告显示是 ObjC 异常穿过 Rust 帧（__rust_foreign_exception → abort），
+# 说明 query() 结构体里还有 iOS 上不存在的 selector。这里给每个查询加一行日志，
+# 并把**确定是 macOS 专有**的两个按平台短路（语义上 iOS 本来就不支持）。
+edit(
+    "src/video_core/src/renderer_metal/metal_device.rs",
+    [
+        (
+            'has_unified_memory: device.hasUnifiedMemory(),',
+            'qf!("hasUnifiedMemory", device.hasUnifiedMemory())',
+            "字段日志: has_unified_memory",
+        ),
+        (
+            'recommended_max_working_set_size: device.recommendedMaxWorkingSetSize(),',
+            'qf!("recommendedMaxWorkingSetSize", device.recommendedMaxWorkingSetSize())',
+            "字段日志: recommended_max_working_set_size",
+        ),
+        (
+            'max_buffer_length: device.maxBufferLength(),',
+            'qf!("maxBufferLength", device.maxBufferLength())',
+            "字段日志: max_buffer_length",
+        ),
+        (
+            'max_threadgroup_memory_length: device.maxThreadgroupMemoryLength(),',
+            'qf!("maxThreadgroupMemoryLength", device.maxThreadgroupMemoryLength())',
+            "字段日志: max_threadgroup_memory_length",
+        ),
+        (
+            'max_argument_buffer_sampler_count: device.maxArgumentBufferSamplerCount(),',
+            'qf!("maxArgumentBufferSamplerCount", device.maxArgumentBufferSamplerCount())',
+            "字段日志: max_argument_buffer_sampler_count",
+        ),
+        (
+            'argument_buffers_tier: device.argumentBuffersSupport(),',
+            'qf!("argumentBuffersSupport", device.argumentBuffersSupport())',
+            "字段日志: argument_buffers_tier",
+        ),
+        (
+            'read_write_texture_tier: device.readWriteTextureSupport(),',
+            'qf!("readWriteTextureSupport", device.readWriteTextureSupport())',
+            "字段日志: read_write_texture_tier",
+        ),
+        (
+            'supports_raster_order_groups: device.areRasterOrderGroupsSupported(),',
+            'qf!("areRasterOrderGroupsSupported", device.areRasterOrderGroupsSupported())',
+            "字段日志: supports_raster_order_groups",
+        ),
+        (
+            'supports_32bit_float_filtering: device.supports32BitFloatFiltering(),',
+            'qf!("supports32BitFloatFiltering", device.supports32BitFloatFiltering())',
+            "字段日志: supports_32bit_float_filtering",
+        ),
+        (
+            'supports_32bit_msaa: device.supports32BitMSAA(),',
+            'qf!("supports32BitMSAA", device.supports32BitMSAA())',
+            "字段日志: supports_32bit_msaa",
+        ),
+        (
+            'supports_query_texture_lod: device.supportsQueryTextureLOD(),',
+            'qf!("supportsQueryTextureLOD", device.supportsQueryTextureLOD())',
+            "字段日志: supports_query_texture_lod",
+        ),
+        (
+            'supports_pull_model_interpolation: device.supportsPullModelInterpolation(),',
+            '// pull-model 插值是 macOS 专有特性；iOS 上直接为 false，避免调 macOS 专有 selector\n            supports_pull_model_interpolation: cfg!(target_os = "macos")\n                && qf!("supportsPullModelInterpolation", device.supportsPullModelInterpolation()),',
+            "字段日志: supports_pull_model_interpolation",
+        ),
+        (
+            'supports_shader_barycentrics: device.supportsShaderBarycentricCoordinates(),',
+            'supports_shader_barycentrics: qf!("supportsShaderBarycentricCoordinates", device.supportsShaderBarycentricCoordinates()),',
+            "字段日志: supports_shader_barycentrics",
+        ),
+        (
+            'supports_function_pointers: objc2::available!(macos = 11.0, ..)\n                && device.supportsFunctionPointers(),',
+            'supports_function_pointers: objc2::available!(macos = 11.0, ios = 14.0, ..)\n                && qf!("supportsFunctionPointers", device.supportsFunctionPointers()),',
+            "字段日志: supports_function_pointers",
+        ),
+        (
+            'supports_raytracing: objc2::available!(macos = 11.0, ..) && device.supportsRaytracing(),',
+            'supports_raytracing: objc2::available!(macos = 11.0, ios = 17.0, ..)\n                && qf!("supportsRaytracing", device.supportsRaytracing()),',
+            "字段日志: supports_raytracing",
+        ),
+        (
+            'supports_depth24_stencil8: device.isDepth24Stencil8PixelFormatSupported(),',
+            '// isDepth24Stencil8PixelFormatSupported 是 macOS 专有\n            supports_depth24_stencil8: cfg!(target_os = "macos")\n                && qf!("isDepth24Stencil8PixelFormatSupported", device.isDepth24Stencil8PixelFormatSupported()),',
+            "字段日志: supports_depth24_stencil8",
+        ),
+        (
+            'sample_counts: [1, 2, 4, 8, 16]\n                .map(|samples| device.supportsTextureSampleCount(samples)),',
+            'sample_counts: [1, 2, 4, 8, 16]\n                .map(|samples| qf!("supportsTextureSampleCount", device.supportsTextureSampleCount(samples))),',
+            "字段日志: sample_counts",
+        ),
+    ],
+)
+
+# ---------------------------------------------------------------------------
+# 15. renderer_metal：qf! 宏（字段查询前先打一行日志）
+# ---------------------------------------------------------------------------
+edit(
+    "src/video_core/src/renderer_metal/metal_device.rs",
+    [
+        (
+            "        Self {\n            // `MTLDevice.architecture()` 是 macOS 14+ 专有",
+            "        // 每次查询前先落日志：一旦某台设备上某个 selector 不存在，\n"
+            "        // 日志最后一行就是它的名字（ObjC 异常会直接 abort，没有 Rust panic）。\n"
+            "        macro_rules! qf {\n"
+            "            ($label:expr, $expr:expr) => {{\n"
+            '                log::info!("[metal] qf {}", $label);\n'
+            "                $expr\n"
+            "            }};\n"
+            "        }\n"
+            "        Self {\n            // `MTLDevice.architecture()` 是 macOS 14+ 专有",
+            "加入 qf! 宏",
+        ),
+    ],
+)
+
+# ---------------------------------------------------------------------------
 print()
 print(f"=== 补丁完成：{changed} 个文件被修改 ===")
 if problems:
