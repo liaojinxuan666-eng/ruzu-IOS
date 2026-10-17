@@ -899,6 +899,35 @@ edit(
     ],
 )
 
+
+# ---------------------------------------------------------------------------
+# 9. renderer_metal：初始化分步日志
+# ---------------------------------------------------------------------------
+# 真机实测：开机日志停在 "即将 RendererMetal::new"，然后进程直接消失。
+# 这里在 4 个子步骤之间插日志，下一次运行就能定位到底哪一步炸的。
+edit(
+    "src/video_core/src/renderer_metal/renderer_metal.rs",
+    [
+        (
+            "        let device = MetalDevice::new()?;\n"
+            "        let layer = unsafe { MetalLayer::from_raw(window_info.render_surface, &device)? };\n"
+            "        let presenter = MetalPresenter::new(layer, &device)?;\n"
+            "        let mut rasterizer = MetalRasterizer::new(device.clone(), syncpoints, device_memory)?;",
+            '        log::info!("[metal] 1/4 创建 MetalDevice");\n'
+            "        let device = MetalDevice::new()?;\n"
+            '        log::info!("[metal] 2/4 MetalDevice OK: {}", device.name());\n'
+            '        log::info!("[metal] 3/4 包装 CAMetalLayer(0x{:x})", window_info.render_surface);\n'
+            "        let layer = unsafe { MetalLayer::from_raw(window_info.render_surface, &device)? };\n"
+            '        log::info!("[metal] layer OK，创建 presenter");\n'
+            "        let presenter = MetalPresenter::new(layer, &device)?;\n"
+            '        log::info!("[metal] presenter OK，创建 rasterizer");\n'
+            "        let mut rasterizer = MetalRasterizer::new(device.clone(), syncpoints, device_memory)?;\n"
+            '        log::info!("[metal] rasterizer OK");',
+            "Metal 初始化分步日志",
+        ),
+    ],
+)
+
 # ---------------------------------------------------------------------------
 print()
 print(f"=== 补丁完成：{changed} 个文件被修改 ===")
