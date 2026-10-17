@@ -73,6 +73,8 @@ targets:
         # （Rust 静态库不自带这些系统库之外的东西，接了 core 之后必须补上）。
         OTHER_LDFLAGS:
           - "-lruzu_ios"
+          # Rust 静态库的 #[link(name="opus")] 不会传给 C 链接器，必须自己加
+          - "-lopus"
           - "-lc++"
           - "-liconv"
           - "-lSystem"
