@@ -20,6 +20,7 @@ core = ["dep:ruzu_core", "dep:video_core", "dep:audio_core", "dep:common"]
 
 [dependencies]
 libc = "0.2"
+log = "0.4"
 # 真正的模拟器核心（可选）。放在普通 [dependencies] 里而不是 target 表里：
 # 这个 crate 本来就只编 iOS，feature 默认关闭，所以不会牵连任何平台。
 ruzu_core = { package = "core", path = "../core", optional = true }
