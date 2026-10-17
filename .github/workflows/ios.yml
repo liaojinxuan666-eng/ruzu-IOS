@@ -239,6 +239,30 @@ jobs:
             exit 1
           fi
 
+      # 用「符号/字符串」核对核心是否真的进了 App —— 体积不可靠：
+      # 静态库 307 MB（带 debug=1 的调试信息），链接后 strip 掉只剩几百 KB。
+      - name: 核对 App 是否真的包含核心
+        if: ${{ inputs.build_ipa }}
+        run: |
+          APP="build/DerivedData/Build/Products/Release-iphoneos/Ruzu.app/Ruzu"
+          SIZE=$(stat -f%z "$APP")
+          BOOT=$(strings "$APP" | grep -c "ruzu_ios_boot" || true)
+          CORE=$(strings "$APP" | grep -c "KMemoryManager" || true)
+          METAL=$(strings "$APP" | grep -c "\[metal\] qf" || true)
+          echo "App 二进制 $SIZE 字节；ruzu_ios_boot=$BOOT KMemoryManager=$CORE metal日志=$METAL"
+          {
+            echo "## App 组成核对（核心是否真的链进来）"
+            echo
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| App 二进制 | $SIZE 字节 |"
+            echo "| ruzu_ios_boot（外壳入口） | $BOOT |"
+            echo "| KMemoryManager（核心） | $CORE |"
+            echo "| \[metal\] qf（Metal 后端） | $METAL |"
+            echo
+            echo "> 体积不代表什么：静态库 307 MB 带调试信息，strip 后只剩几百 KB 是正常的。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: 打包未签名 IPA
         if: ${{ inputs.build_ipa }}
         run: |
