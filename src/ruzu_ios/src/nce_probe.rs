@@ -234,7 +234,7 @@ fn probe_exclusive_monitor(out: &mut String) {
             Ok(p) => p,
         };
 
-        // 代码页 + 数据（放在同一页的后半部分，避开代码）
+        // 代码页（RW → 写入 → 变 RX）
         if let Err(e) = write_code_at(page, 64 * 1024, &CODE_RMW) {
             writeln!(out, "[FAIL] ③ 页面无法写入：{e}").unwrap();
             libc::munmap(page as *mut c_void, 64 * 1024);
@@ -246,9 +246,12 @@ fn probe_exclusive_monitor(out: &mut String) {
             return;
         }
         crate::log_line("NCE③: 即将多线程执行独占监视器测试");
-        let rmw: extern "C" fn(*mut u32) -> u32 = std::mem::transmute(page);
-        let counter = page.add(32 * 1024) as *mut u32;
-        *counter = 0;
+
+        // **数据绝对不能放在代码页里**：写完代码后整页是 R-X（只读），
+        // 往里面写会立刻 SIGBUS —— 2026-10-17 真机就是崩在这一行。
+        // 用栈上的变量当计数器即可（独占监视器对任何地址都有效）。
+        let mut local_counter: u32 = 0;
+        let counter: *mut u32 = &mut local_counter;
 
         // 多线程要用地址（usize），裸指针不是 Send，不能直接跨线程捕获
         let counter_addr = counter as usize;
