@@ -189,3 +189,52 @@ int ruzu_try_self_trace(char *why, size_t why_len) {
     }
     return 0;
 }
+
+// ---------------------------------------------------------------- 崩溃记录器
+//
+// 目的：硬错误（SIGSEGV/SIGBUS/SIGILL/SIGFPE）不可被 catch_unwind 捕获，
+// 进程会立刻消失，我们连"崩在哪一步"都不知道。
+// 这里在信号处理器里把**信号号、故障地址、PC、LR** 写进探测日志，
+// 然后恢复默认处理并重新 raise —— 系统照常生成 .ips 崩溃报告，
+// 两种信息互相印证。
+
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/ucontext.h>
+
+// Rust 侧提供的写日志函数
+extern void ruzu_log_line(const char *msg);
+
+static void ruzu_crash_handler(int sig, siginfo_t *info, void *uap) {
+    char buf[512];
+    uintptr_t far = (uintptr_t)(info ? info->si_addr : 0);
+    uintptr_t pc = 0;
+    uintptr_t lr = 0;
+#if defined(__arm64__)
+    ucontext_t *uc = (ucontext_t *)uap;
+    if (uc != NULL) {
+        pc = (uintptr_t)uc->uc_mcontext->__ss.__pc;
+        lr = (uintptr_t)uc->uc_mcontext->__ss.__lr;
+    }
+#endif
+    snprintf(buf, sizeof(buf),
+             "[CRASH] signal=%d addr=0x%lx pc=0x%lx lr=0x%lx", sig,
+             (unsigned long)far, (unsigned long)pc, (unsigned long)lr);
+    ruzu_log_line(buf);
+
+    // 恢复默认处理再抛一次：让系统生成正常的崩溃报告
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+void ruzu_install_crash_handler(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = ruzu_crash_handler;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGILL, &sa, NULL);
+    sigaction(SIGFPE, &sa, NULL);
+}
