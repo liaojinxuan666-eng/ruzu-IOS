@@ -84,6 +84,11 @@ pub fn boot(
 
     // ---------------------------------------------------------------- 系统
     let mut system = System::new();
+    // **必须**在 load() 之前调用：initialize() 会分配设备内存、创建 Memory 桥、
+    // 按设置决定多核/异步 GPU 等。漏了它，load() 里第一句
+    // `.expect("VFS must be created in initialize()")` 就会 panic。
+    system.initialize();
+    crate::log_line("boot: system.initialize() 完成");
 
     let shown_for_factory = Arc::clone(&window_shown);
     let layout_for_factory = Arc::clone(&framebuffer_layout);
