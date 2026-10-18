@@ -73,6 +73,34 @@ pub fn boot(
         ));
     }
 
+    // iOS 的 RLIMIT_STACK 默认很小（实测 999424 字节 ≈ 976 KiB），而 `context`
+    // crate 分配 fiber 栈时会拿请求大小跟它比 —— 于是我们只能拿到 960 KiB，
+    // 内核初始化路径会爆栈（真机崩溃：CoreTiming → KernelCore::initialize）。
+    // 这里先尝试把软上限提到硬上限，让 4 MiB 的 fiber 栈可用。
+    unsafe {
+        let mut rl: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_STACK, &mut rl) == 0 {
+            crate::log_line(&format!(
+                "boot: RLIMIT_STACK cur={} max={}",
+                rl.rlim_cur, rl.rlim_max
+            ));
+            if rl.rlim_cur < rl.rlim_max {
+                let want = rl.rlim_max.min(32 * 1024 * 1024);
+                let new = libc::rlimit {
+                    rlim_cur: want,
+                    rlim_max: rl.rlim_max,
+                };
+                let rc = libc::setrlimit(libc::RLIMIT_STACK, &new);
+                let mut after: libc::rlimit = std::mem::zeroed();
+                libc::getrlimit(libc::RLIMIT_STACK, &mut after);
+                crate::log_line(&format!(
+                    "boot: setrlimit(RLIMIT_STACK) rc={rc} → cur={}",
+                    after.rlim_cur
+                ));
+            }
+        }
+    }
+
     // 调试开关：在 App 的 Documents 下放一个空文件即可改变执行模式（不用重新打包）。
     //   single_core.flag  → 单核跑（排除多核竞争导致的崩溃）
     //   synchronous_gpu.flag → GPU 同步执行（排除 GPU 线程竞争）
