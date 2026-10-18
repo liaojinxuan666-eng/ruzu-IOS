@@ -59,6 +59,34 @@ pub fn boot(
     scale: f32,
 ) -> Result<BootSession, String> {
     crate::log_line(&format!("=== boot 开始：{path} ==="));
+
+    // ruzu 按 Linux 习惯把数据放在 ~/.local/share/ruzu 等目录下；iOS 沙盒里
+    // 这些目录默认不存在 → 启动日志会刷 16 条 ERROR，且 keys/nand/sdmc 都
+    // 指向不存在的路径。这里在启动时一次性建好（HOME 就是 App 的沙盒根）。
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = std::path::PathBuf::from(home);
+        for rel in [
+            ".local/share/ruzu",
+            ".local/share/ruzu/amiibo",
+            ".local/share/ruzu/crash_dumps",
+            ".local/share/ruzu/dump",
+            ".local/share/ruzu/keys",
+            ".local/share/ruzu/load",
+            ".local/share/ruzu/log",
+            ".local/share/ruzu/nand",
+            ".local/share/ruzu/play_time",
+            ".local/share/ruzu/screenshots",
+            ".local/share/ruzu/sdmc",
+            ".local/share/ruzu/tas",
+            ".local/share/ruzu/icons",
+            ".cache/ruzu",
+            ".cache/ruzu/shader",
+            ".config/ruzu",
+        ] {
+            let _ = std::fs::create_dir_all(home.join(rel));
+        }
+        crate::log_line("boot: ruzu 数据目录已就绪");
+    }
     unsafe { crate::ruzu_install_crash_handler(); }
     crate::log_line("boot: 崩溃记录器已安装");
 
