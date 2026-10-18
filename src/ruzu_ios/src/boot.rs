@@ -137,8 +137,21 @@ pub fn boot(
         let system_ref = SystemRef::from_ref(&*system);
         crate::log_line("boot(factory): 即将 create_gpu");
         let gpu = video_core::video_core::create_gpu(system_ref, |backend, gpu| {
-            let frame_displayed_notify: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
-            let frame_end_notify: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+            // 帧计数：用来回答「客人到底有没有在出帧」这个最关键的问题。
+            static DISPLAYED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            static SUBMITTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let frame_displayed_notify: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {
+                let n = DISPLAYED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n == 1 || n % 60 == 0 {
+                    crate::log_line(&format!("[frame] 已显示 {n} 帧"));
+                }
+            });
+            let frame_end_notify: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {
+                let n = SUBMITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n == 1 || n % 60 == 0 {
+                    crate::log_line(&format!("[frame] GPU 已提交 {n} 次"));
+                }
+            });
 
             let renderer: Box<dyn RendererBase> = match backend {
                 common::settings_enums::RendererBackend::Metal => {
