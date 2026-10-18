@@ -64,11 +64,11 @@ pub fn boot(
     // 单核还是多核、GPU 是否异步 —— 这些直接决定客人跑不跑。
     {
         let values = common::settings::values();
+        // 只打印**确认存在**的字段（is_async_gpu 不是设置项，之前猜错导致构建失败）。
         crate::log_line(&format!(
-            "boot: 设置 cpu_backend={:?} multicore={} async_gpu={} renderer={:?}",
+            "boot: 设置 cpu_backend={:?} multicore={} renderer={:?}",
             *values.cpu_backend.get_value(),
             *values.use_multi_core.get_value(),
-            *values.is_async_gpu.get_value(),
             *values.renderer_backend.get_value(),
         ));
     }
