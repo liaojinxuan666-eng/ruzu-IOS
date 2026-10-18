@@ -60,6 +60,19 @@ pub fn boot(
 ) -> Result<BootSession, String> {
     crate::log_line(&format!("=== boot 开始：{path} ==="));
 
+    // 把关键设置打出来：CPU 后端选的是不是 dynarmic（iOS 没编译 NCE）、
+    // 单核还是多核、GPU 是否异步 —— 这些直接决定客人跑不跑。
+    {
+        let values = common::settings::values();
+        crate::log_line(&format!(
+            "boot: 设置 cpu_backend={:?} multicore={} async_gpu={} renderer={:?}",
+            *values.cpu_backend.get_value(),
+            *values.use_multi_core.get_value(),
+            *values.is_async_gpu.get_value(),
+            *values.renderer_backend.get_value(),
+        ));
+    }
+
     // ruzu 按 Linux 习惯把数据放在 ~/.local/share/ruzu 等目录下；iOS 沙盒里
     // 这些目录默认不存在 → 启动日志会刷 16 条 ERROR，且 keys/nand/sdmc 都
     // 指向不存在的路径。这里在启动时一次性建好（HOME 就是 App 的沙盒根）。
