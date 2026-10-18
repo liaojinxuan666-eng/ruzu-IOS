@@ -303,7 +303,7 @@ struct ProbeFileLogger;
 
 impl log::Log for ProbeFileLogger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
-        metadata.level() <= log::Level::Info
+        metadata.level() <= log::Level::Debug
     }
 
     fn log(&self, record: &log::Record) {
@@ -319,7 +319,9 @@ fn install_logger() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let _ = log::set_logger(&ProbeFileLogger);
-        log::set_max_level(log::LevelFilter::Info);
+        // Debug 级别：客人侧的服务调用/线程/内核事件都在这个级别，
+        // 排查"客人不渲染"时必须看得到。
+        log::set_max_level(log::LevelFilter::Debug);
     });
 }
 
