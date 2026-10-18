@@ -13,6 +13,7 @@ final class ViewController: UIViewController, UIDocumentPickerDelegate {
     private let previewView = MetalPreviewView()
     private let textView = UITextView()
     private let statusLabel = UILabel()
+    private var previewHeight: NSLayoutConstraint?
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -83,13 +84,15 @@ final class ViewController: UIViewController, UIDocumentPickerDelegate {
         stack.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(stack)
 
+        previewHeight = previewView.heightAnchor.constraint(equalToConstant: 160)
         let guide = view.safeAreaLayoutGuide
         NSLayoutConstraint.activate([
             stack.topAnchor.constraint(equalTo: guide.topAnchor, constant: 12),
             stack.leadingAnchor.constraint(equalTo: guide.leadingAnchor, constant: 16),
             stack.trailingAnchor.constraint(equalTo: guide.trailingAnchor, constant: -16),
             stack.bottomAnchor.constraint(equalTo: guide.bottomAnchor, constant: -12),
-            previewView.heightAnchor.constraint(equalToConstant: 160),
+            // 默认 160pt 的小预览；开机时会被放大到接近全屏
+            previewHeight ?? previewView.heightAnchor.constraint(equalToConstant: 160),
             textView.heightAnchor.constraint(greaterThanOrEqualToConstant: 240),
         ])
     }
@@ -216,6 +219,10 @@ final class ViewController: UIViewController, UIDocumentPickerDelegate {
             try FileManager.default.copyItem(at: url, to: dst)
             append("已拷入沙盒：\(dst.lastPathComponent)")
             append("开始启动（加载 → 建 Metal 渲染器 → 起 CPU 线程）…")
+            // 放大预览视图：Metal presenter 会按 layer 的 drawableSize 输出，
+            // 所以这里放大后画面自然变大。
+            previewHeight?.constant = max(240, view.bounds.height * 0.55)
+            UIView.animate(withDuration: 0.2) { self.view.layoutIfNeeded() }
             // 在主线程取好 layer 与尺寸，再交给后台线程开机
             previewView.isHidden = false
             view.layoutIfNeeded()
