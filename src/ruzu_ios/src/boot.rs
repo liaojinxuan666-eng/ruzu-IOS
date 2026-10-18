@@ -73,6 +73,21 @@ pub fn boot(
         ));
     }
 
+    // 调试开关：在 App 的 Documents 下放一个空文件即可改变执行模式（不用重新打包）。
+    //   single_core.flag  → 单核跑（排除多核竞争导致的崩溃）
+    //   synchronous_gpu.flag → GPU 同步执行（排除 GPU 线程竞争）
+    if let Some(home) = std::env::var_os("HOME") {
+        let docs = std::path::PathBuf::from(home).join("Documents");
+        if docs.join("single_core.flag").exists() {
+            std::env::set_var("RUZU_SINGLE_CORE", "1");
+            crate::log_line("boot: 检测到 single_core.flag → 单核模式");
+        }
+        if docs.join("synchronous_gpu.flag").exists() {
+            std::env::set_var("RUZU_SYNC_GPU", "1");
+            crate::log_line("boot: 检测到 synchronous_gpu.flag → GPU 同步模式");
+        }
+    }
+
     // ruzu 按 Linux 习惯把数据放在 ~/.local/share/ruzu 等目录下；iOS 沙盒里
     // 这些目录默认不存在 → 启动日志会刷 16 条 ERROR，且 keys/nand/sdmc 都
     // 指向不存在的路径。这里在启动时一次性建好（HOME 就是 App 的沙盒根）。
